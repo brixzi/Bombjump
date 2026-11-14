@@ -34,186 +34,613 @@ end
 -- script's long-lived top-level local count (Luau has a per-function local limit).
 local fireflyDiag = {}
 do
-    fireflyDiag.lines = {}
-    fireflyDiag.startedAt = os.clock()
-
-    fireflyDiag.refresh = function()
-        local state = fireflyDiag
-        if not state.textLabel or not state.scroll then
-            return
+    local state = fireflyDiag
+    local function initialize()
+        local function number(value, fallback)
+            return type(value) == "number" and value == value and math.abs(value) < math.huge and value or fallback
         end
-        local first = math.max(1, #state.lines - 11)
-        local shown = {}
-        for i = first, #state.lines do
-            shown[#shown + 1] = state.lines[i]
+        local history = sharedEnv.__StandaloneBombJumpFireflyDiagnosticHistory
+        if type(history) ~= "table" or type(history.lines) ~= "table" then
+            history = {lines = {}, startedAt = os.clock()}
+            sharedEnv.__StandaloneBombJumpFireflyDiagnosticHistory = history
         end
-        state.textLabel.Text = table.concat(shown, "\n")
-        local height = math.max(160, #shown * 18)
-        state.textLabel.Size = UDim2.new(1, -8, 0, height)
-        state.scroll.CanvasSize = UDim2.new(0, 0, 0, height + 6)
-        state.scroll.CanvasPosition = Vector2.new(0, math.max(0, height - state.scroll.AbsoluteSize.Y))
-    end
-
-    fireflyDiag.log = function(tag, detail)
-        local state = fireflyDiag
-        local elapsed = os.clock() - state.startedAt
-        local line = string.format("+%.3fs | %s%s", elapsed, tostring(tag),
-            detail ~= nil and (" | " .. tostring(detail)) or "")
-        state.lines[#state.lines + 1] = line
-        if #state.lines > 180 then
-            table.remove(state.lines, 1)
-        end
-        pcall(state.refresh)
-    end
-
-    local function makeButton(parent, name, buttonText, pos, size, callback)
-        local button = Instance.new("TextButton")
-        button.Name = name
-        button.Position = pos
-        button.Size = size
-        button.BackgroundColor3 = Color3.fromRGB(45, 48, 58)
-        button.BorderSizePixel = 0
-        button.TextColor3 = Color3.fromRGB(240, 242, 248)
-        button.TextSize = 11
-        button.Font = Enum.Font.GothamSemibold
-        button.Text = buttonText
-        button.AutoButtonColor = true
-        button.Parent = parent
-        button.Activated:Connect(callback)
-        return button
-    end
-
-    local function createGui()
-        local state = fireflyDiag
-        local gui = Instance.new("ScreenGui")
-        gui.Name = "__Standalone_BombJump_Firefly_Diagnostics"
-        gui.ResetOnSpawn = false
-        gui.IgnoreGuiInset = true
-        gui.DisplayOrder = 10000
-        local parentOk = pcall(function() gui.Parent = CoreGui end)
-        if not parentOk or not gui.Parent then
-            local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 3)
-            if playerGui then gui.Parent = playerGui end
-        end
-        if not gui.Parent then
-            gui:Destroy()
-            return
-        end
-        state.gui = gui
-
-        local panel = Instance.new("Frame")
-        panel.Name = "Panel"
-        panel.AnchorPoint = Vector2.new(0.5, 0)
-        panel.Position = UDim2.new(0.5, 0, 0.06, 0)
-        panel.Size = UDim2.new(0.96, 0, 0, 238)
-        panel.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
-        panel.BorderSizePixel = 0
-        panel.Active = true
-        panel.Draggable = true
-        panel.Parent = gui
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 8)
-        corner.Parent = panel
-        local stroke = Instance.new("UIStroke")
-        stroke.Color = Color3.fromRGB(88, 96, 116)
-        stroke.Thickness = 1
-        stroke.Parent = panel
-        state.panel = panel
-
-        local header = Instance.new("Frame")
-        header.Name = "Header"
-        header.Size = UDim2.new(1, 0, 0, 32)
-        header.BackgroundColor3 = Color3.fromRGB(34, 37, 46)
-        header.BorderSizePixel = 0
-        header.Parent = panel
-        header.Active = true
-        header.Draggable = true
-        local title = Instance.new("TextLabel")
-        title.BackgroundTransparency = 1
-        title.Position = UDim2.new(0, 9, 0, 0)
-        title.Size = UDim2.new(1, -190, 1, 0)
-        title.Font = Enum.Font.GothamBold
-        title.TextSize = 11
-        title.TextXAlignment = Enum.TextXAlignment.Left
-        title.TextColor3 = Color3.fromRGB(238, 240, 248)
-        title.Text = "FIREFLY DEBUG v18"
-        title.Parent = header
-        makeButton(header, "Copy", "COPIAR", UDim2.new(1, -174, 0, 5), UDim2.new(0, 57, 0, 22), function()
-            local content = table.concat(state.lines, "\n")
-            local ok = false
-            if type(setclipboard) == "function" then
-                ok = pcall(setclipboard, content)
-            elseif type(toclipboard) == "function" then
-                ok = pcall(toclipboard, content)
+        history.startedAt = number(history.startedAt, os.clock())
+        history.attempts = math.max(0, math.floor(number(history.attempts, 0)))
+        history.clears = math.max(0, math.floor(number(history.clears, 0)))
+        history.runs = math.max(0, math.floor(number(history.runs, 0))) + 1
+        state.history, state.lines, state.startedAt = history, history.lines, history.startedAt
+        history.owner = state
+        state.build = "firefly-workbench-v1"
+        state.fileName = "firefly_jar_diagnostics.txt"
+        state.connections, state.records, state.attempts, state.order = {}, {}, {}, {}
+        state.view, state.page, state.follow = "summary", 1, true
+        state.pageSize, state.detailed = 45, false
+        state.enabled, state.stopped = false, false
+        local colors = {
+            window = Color3.fromRGB(13, 17, 23), header = Color3.fromRGB(22, 27, 34),
+            border = Color3.fromRGB(48, 54, 61), text = Color3.fromRGB(230, 237, 243),
+            muted = Color3.fromRGB(139, 148, 158), accent = Color3.fromRGB(126, 231, 135),
+            warn = Color3.fromRGB(227, 179, 65), error = Color3.fromRGB(255, 123, 114),
+            button = Color3.fromRGB(33, 38, 45), blue = Color3.fromRGB(121, 192, 255),
+        }
+        state.colors = colors
+        local names = {
+            DIAG_SESSION = "Sessão iniciada", FIREFLY_MODE = "Diagnóstico ativo", DIAG = "Histórico limpo",
+            ACTIVATION_BEGIN = "Início da tentativa", ARM_SENSOR = "Sensor do braço pronto",
+            ACTIVATION_PATH = "Caminho de ativação", TOOL_ACTIVATED = "Jar ativado",
+            ACTIVATION_RESULT = "Retorno da ativação", PLAYER_LOCK_BEGIN = "Controle automático iniciado",
+            SEQUENCE_BEGIN = "Animação reconhecida", FIRST_TAKEOFF_CONFIRMED = "Primeiro salto confirmado",
+            LID_BOUND = "Tampa identificada", MOVE_WINDOW_BEGIN = "Janela de aproximação",
+            FIRST_DESCENT_OBSERVED = "Descida observada", FIRST_LANDING_OBSERVED = "Primeiro pouso observado",
+            LANDED_STATE = "Superfície do pouso", LID_LANDING_HANDLER = "Contato com a tampa",
+            LID_PHYSICS_CONTACT = "Contato físico com a tampa", LID_JUMP_REQUEST = "Segundo salto solicitado",
+            JUMP_REQUEST_SENT = "Comando de salto enviado", POST_DESCENT_TAKEOFF = "Segundo impulso confirmado",
+            RELEASE_HANDLER_ENTER = "Verificando liberação", PLAYER_UNLOCK_DONE = "Controles restaurados",
+            AUTO_MOVE_STOP = "Correção de movimento encerrada", ATTEMPT_FINISH = "Tentativa encerrada",
+            ACTIVATION_ERROR = "Erro de ativação", ACTIVATION_FAILED = "Ativação falhou",
+            ARM_SENSOR_FAILED = "Sensor indisponível", AUTO_MOVE_FAILURE = "Aproximação interrompida",
+            MOVE_WINDOW_EXPIRED = "Janela de movimento encerrada", LID_REJECTED = "Tampa descartada",
+        }
+        local traceTags = {
+            ARM_TRACE = true, AUTO_TRACE = true, AUTO_TRACE_WAIT = true, AUTO_TRACE_CLIMB = true,
+            PHYSICS_CHECK = true, STATE_EVENT = true, JUMPING_EVENT = true,
+            JUMP_REQUEST_ISSUE = true, JUMP_EVENT_WAIT_IMPULSE = true, STATE_EVENT_WAIT_IMPULSE = true,
+            JUMP_FLAG_CLEAR = true, LID_LANDING_HANDLER = true, RELEASE_HANDLER_SKIP = true,
+        }
+        local function fields(detail)
+            local values = {}
+            for segment in detail:gmatch("[^;]+") do
+                local key, value = segment:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+                if key then values[key] = value end
             end
-            if state.statusLabel then
-                state.statusLabel.Text = ok and "Histórico copiado." or "Clipboard indisponível: envie uma captura do painel."
+            return values
+        end
+        local function vector(value)
+            if type(value) ~= "string" then return nil end
+            local components = {}
+            for item in value:gmatch("[-+]?%d*%.?%d+") do components[#components + 1] = tonumber(item) end
+            return components
+        end
+        local function condition(values)
+            local velocity, look = vector(values.velocity), vector(values.facing)
+            if not velocity or #velocity < 3 then return "movimento não registrado" end
+            local x, z = velocity[1], velocity[3]
+            local speed = math.sqrt(x * x + z * z)
+            if speed < 0.5 then return "parado" end
+            if not look or #look < 2 then return string.format("movimento %.1f studs/s", speed) end
+            local length = math.sqrt(look[1] * look[1] + look[2] * look[2])
+            if length < 0.01 then return "em movimento" end
+            local dot = (x * look[1] + z * look[2]) / (speed * length)
+            if dot > 0.85 then return "para frente" end
+            if dot < -0.85 then return "para trás" end
+            if math.abs(dot) < 0.35 then return "lateral" end
+            return "diagonal"
+        end
+        local function attemptFor(id, time)
+            local attempt = state.attempts[id]
+            if not attempt then
+                attempt = {id = id, start = time, last = time, status = "EM CURSO", reason = "Aguardando os próximos eventos",
+                    records = {}, flags = {}, condition = "movimento não registrado"}
+                state.attempts[id] = attempt
+                if id > 0 then state.order[#state.order + 1] = id end
             end
-        end)
-        makeButton(header, "Clear", "LIMPAR", UDim2.new(1, -112, 0, 5), UDim2.new(0, 54, 0, 22), function()
-            state.lines = {}
-            state.startedAt = os.clock()
-            state.log("DIAG", "Histórico limpo; aguardando eventos")
-        end)
-        makeButton(header, "Hide", "MIN", UDim2.new(1, -54, 0, 5), UDim2.new(0, 47, 0, 22), function()
-            panel.Visible = false
-            if state.toggle then state.toggle.Visible = true end
-        end)
-
-        local scroll = Instance.new("ScrollingFrame")
-        scroll.Name = "LogScroll"
-        scroll.Position = UDim2.new(0, 6, 0, 37)
-        scroll.Size = UDim2.new(1, -12, 1, -61)
-        scroll.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
-        scroll.BorderSizePixel = 0
-        scroll.ScrollBarThickness = 5
-        scroll.CanvasSize = UDim2.new(0, 0, 0, 160)
-        scroll.Parent = panel
-        local scrollCorner = Instance.new("UICorner")
-        scrollCorner.CornerRadius = UDim.new(0, 5)
-        scrollCorner.Parent = scroll
-        state.scroll = scroll
-        local body = Instance.new("TextLabel")
-        body.Name = "LogText"
-        body.Position = UDim2.new(0, 4, 0, 3)
-        body.Size = UDim2.new(1, -8, 0, 160)
-        body.BackgroundTransparency = 1
-        body.Font = Enum.Font.Code
-        body.TextSize = 10
-        body.TextColor3 = Color3.fromRGB(215, 222, 236)
-        body.TextXAlignment = Enum.TextXAlignment.Left
-        body.TextYAlignment = Enum.TextYAlignment.Top
-        body.TextWrapped = true
-        body.Text = "Iniciando diagnóstico..."
-        body.Parent = scroll
-        state.textLabel = body
-        local status = Instance.new("TextLabel")
-        status.Name = "Status"
-        status.Position = UDim2.new(0, 8, 1, -20)
-        status.Size = UDim2.new(1, -16, 0, 16)
-        status.BackgroundTransparency = 1
-        status.Font = Enum.Font.Gotham
-        status.TextSize = 9
-        status.TextXAlignment = Enum.TextXAlignment.Left
-        status.TextColor3 = Color3.fromRGB(174, 183, 201)
-        status.Text = "Copie o histórico após reproduzir o atraso."
-        status.Parent = panel
-        state.statusLabel = status
-        state.toggle = makeButton(gui, "ShowDiagnostics", "FIRE FLY DBG", UDim2.new(1, -116, 0, 58), UDim2.new(0, 108, 0, 26), function()
-            panel.Visible = true
+            return attempt
+        end
+        local function ingest(line, fallbackAttempt)
+            local elapsed, tag, detail = line:match("^%+([%d%.]+)s%s*|%s*([^|]-)%s*|%s*(.*)$")
+            if not elapsed then
+                elapsed, tag = line:match("^%+([%d%.]+)s%s*|%s*(.-)%s*$")
+                detail = ""
+            end
+            if not elapsed then elapsed, tag, detail = "0", "LEGACY_RECORD", line end
+            local explicit = detail:match("^attempt=(%d+)")
+            local id = tonumber(explicit) or fallbackAttempt or 0
+            detail = detail:gsub("^attempt=%d+;%s*", ""):gsub("^attempt=%d+$", "")
+            local record = {index = #state.records + 1, time = tonumber(elapsed) or 0,
+                tag = tag, detail = detail, attempt = id, trace = traceTags[tag] == true}
+            record.level = (tag:find("ERROR", 1, true) or tag:find("FAILED", 1, true) or tag == "AUTO_MOVE_FAILURE") and "ERRO"
+                or (tag == "ATTEMPT_FINISH" or tag:find("EXPIRED", 1, true) or tag:find("ABORT", 1, true)) and "AVISO"
+                or "INFO"
+            state.records[#state.records + 1] = record
+            local attempt = attemptFor(id, record.time)
+            attempt.last = record.time
+            attempt.records[#attempt.records + 1] = record
+            local values = tag == "ACTIVATION_BEGIN" and fields(detail) or {}
+            local flags = attempt.flags
+            if tag == "ACTIVATION_BEGIN" then
+                attempt.start, attempt.condition, attempt.ping = record.time, condition(values), values.ping
+            elseif tag == "TOOL_ACTIVATED" then flags.activation = true
+            elseif tag == "SEQUENCE_BEGIN" then flags.animation = true
+            elseif tag == "FIRST_TAKEOFF_CONFIRMED" then flags.first = true
+            elseif tag == "LID_BOUND" then flags.lid = true
+            elseif tag == "LID_JUMP_REQUEST" then flags.contact, flags.request = true, true
+            elseif tag == "POST_DESCENT_TAKEOFF" then flags.impulse = true
+            elseif tag == "RELEASE_HANDLER_ENTER" then
+                if detail:find("source=jump event with upward impulse", 1, true)
+                    or detail:find("source=state event with upward impulse", 1, true)
+                    or detail:find("source=physics impulse confirmed by player ascent", 1, true) then flags.impulse = true end
+            elseif tag == "PLAYER_UNLOCK_DONE" then
+                flags.controls = true
+                if flags.request and flags.impulse then
+                    attempt.status, attempt.reason = "CONFIRMADO", "Contato e segundo impulso registrados"
+                else
+                    attempt.status, attempt.reason = "INCONCLUSIVO", "Controles liberados sem prova completa do segundo salto na tampa"
+                end
+            end
+            if tag == "ATTEMPT_FINISH" or tag == "ACTIVATION_FAILED" or tag == "ACTIVATION_ERROR"
+                or tag == "ARM_SENSOR_FAILED" or tag == "AUTO_MOVE_FAILURE" then
+                attempt.status, attempt.reason, attempt.errorTag = "FALHOU", detail, tag
+            elseif tag == "ACTIVATION_CANCELLED" then
+                attempt.status, attempt.reason, attempt.errorTag = "CANCELADO", detail, tag
+            end
+            return record
+        end
+        local legacyAttempt = 0
+        for index, value in ipairs(history.lines) do
+            local line = tostring(value)
+            history.lines[index] = line
+            if line:find("| ACTIVATION_BEGIN |", 1, true) and not line:find("attempt=", 1, true) then legacyAttempt += 1 end
+            local record = ingest(line, legacyAttempt)
+            history.attempts = math.max(history.attempts, record.attempt)
+        end
+        if #history.lines > 0 and not tostring(history.lines[1]):find("| DIAG", 1, true) then
+            state.legacyNotice = "O histórico importado começa no meio da sessão; registros já descartados por versões antigas não podem ser reconstruídos."
+        end
+        state.selected = state.order[#state.order] or 0
+        local function resultColor(attempt)
+            if attempt and attempt.status == "CONFIRMADO" then return colors.accent end
+            if attempt and attempt.status == "FALHOU" then return colors.error end
+            if attempt and (attempt.status == "INCONCLUSIVO" or attempt.status == "CANCELADO") then return colors.warn end
+            return colors.blue
+        end
+        local function outcomeReason(attempt)
+            local reason = attempt.reason
+            if reason:find("landed off lid", 1, true) then return "O primeiro pouso terminou fora da tampa; não há segundo salto confirmado." end
+            if reason:find("second jump failed", 1, true) then return "O segundo salto foi solicitado, mas o impulso não foi confirmado dentro da janela." end
+            if reason:find("first jump not detected", 1, true) then return "O primeiro salto foi solicitado, mas a saída do chão não foi confirmada." end
+            if reason:find("lid not detected", 1, true) then return "Nenhuma tampa válida apareceu dentro da janela de busca." end
+            if reason:find("right arm trigger timed out", 1, true) then return "A animação esperada do braço não foi reconhecida dentro da janela." end
+            return reason
+        end
+        local function summary(attempt)
+            if not attempt or attempt.id == 0 then
+                return "AGUARDANDO TENTATIVA\n\nSelecione Firefly Jar e use o botão de salto.\nCada tentativa terá resultado, etapas e eventos próprios.\n\nCOPIAR TUDO inclui todas as tentativas e todos os registros.\nLIMPAR é a única ação que apaga este histórico."
+            end
+            local lines = {
+                string.format("TENTATIVA #%03d  /  %s", attempt.id, attempt.status), "", outcomeReason(attempt), "",
+                "Movimento     " .. attempt.condition,
+                "Ping          " .. (attempt.ping or "não registrado"),
+                string.format("Duração       %.3f s", math.max(0, attempt.last - attempt.start)),
+                string.format("Registros     %d", #attempt.records), "", "ETAPAS OBSERVADAS", "",
+            }
+            local stages = {{"activation", "Jar ativado"}, {"animation", "Animação reconhecida"},
+                {"first", "Primeiro salto"}, {"lid", "Tampa identificada"}, {"contact", "Contato na tampa"},
+                {"request", "Segundo salto solicitado"}, {"impulse", "Segundo impulso"}, {"controls", "Controles liberados"}}
+            for _, stage in ipairs(stages) do
+                lines[#lines + 1] = string.format("  %-13s %s", attempt.flags[stage[1]] and "OK" or "não observado", stage[2])
+            end
+            if attempt.errorTag then lines[#lines + 1] = "Origem: " .. attempt.errorTag end
+            lines[#lines + 1] = "\nEtapa não observada não significa causa comprovada."
+            return table.concat(lines, "\n")
+        end
+        state.summary = summary
+        local function wrap(text, columns)
+            local output = {}
+            for line in (text .. "\n"):gmatch("(.-)\n") do
+                if #line <= columns then output[#output + 1] = line
+                else
+                    local indent, current = line:match("^%s*") or "", ""
+                    for word in line:gmatch("%S+") do
+                        if #current > #indent and #current + #word + 1 > columns then
+                            output[#output + 1], current = current, indent .. word
+                        else current = current == "" and (indent .. word) or current .. " " .. word end
+                    end
+                    output[#output + 1] = current
+                end
+            end
+            return table.concat(output, "\n")
+        end
+        local function eventDetail(record, attempt)
+            if record.tag == "ACTIVATION_BEGIN" and attempt then
+                return attempt.condition .. " / ping " .. (attempt.ping or "n/d")
+            end
+            if record.tag == "ATTEMPT_FINISH" and attempt then return outcomeReason(attempt) end
+            if record.tag == "PLAYER_UNLOCK_DONE" and attempt then return attempt.status .. " / " .. attempt.reason end
+            if record.tag == "ARM_SENSOR" then
+                local values = fields(record.detail)
+                return (values.rig or "rig n/d"):gsub("Enum.HumanoidRigType%.", "") .. " / " .. (values.sensor or "sensor n/d")
+            end
+            return (record.detail:match("^[^;]+") or record.detail)
+                :gsub("Enum.HumanoidStateType%.", ""):gsub("Enum.Material%.", "")
+        end
+        state.export = function()
+            local output = {
+                "FIREFLY JAR / DIAGNÓSTICO COMPLETO", "Build: " .. state.build,
+                string.format("Execuções: %d | Tentativas: %d | Registros: %d | Limpezas explícitas: %d",
+                    history.runs, #state.order, #history.lines, history.clears),
+                "Retenção: sem descarte automático. Os registros brutos abaixo são integrais.",
+            }
+            if state.legacyNotice then output[#output + 1] = "Aviso de importação: " .. state.legacyNotice end
+            output[#output + 1] = "\nÍNDICE DAS TENTATIVAS"
+            for _, id in ipairs(state.order) do
+                local item = state.attempts[id]
+                output[#output + 1] = string.format("#%03d | %-12s | %s | ping %s | %.3f s | %d eventos",
+                    id, item.status, item.condition, item.ping or "n/d", math.max(0, item.last - item.start), #item.records)
+            end
+            for _, id in ipairs(state.order) do output[#output + 1] = "\n" .. summary(state.attempts[id]) end
+            output[#output + 1] = "\nREGISTROS BRUTOS INTEGRAIS / ORDEM CRONOLÓGICA\n"
+            output[#output + 1] = table.concat(history.lines, "\n")
+            return table.concat(output, "\n")
+        end
+        state.persist = function()
+            if history.owner ~= state or #history.lines == 0 or type(writefile) ~= "function" then return false end
+            local ok = pcall(writefile, state.fileName, state.export())
+            state.fileSaved = ok
+            return ok
+        end
+        local function status(message)
+            state.notice = message
+            if state.statusLabel then state.statusLabel.Text = message end
+        end
+        state.status = status
+        local function connect(signal, callback)
+            local connection = signal:Connect(callback)
+            state.connections[#state.connections + 1] = connection
+            return connection
+        end
+        local function stopGui()
+            state.drag = nil
+            for _, connection in ipairs(state.connections) do pcall(function() connection:Disconnect() end) end
+            state.connections = {}
+            if state.gui then pcall(function() state.gui:Destroy() end) end
+            state.gui, state.textLabel, state.scroll, state.statusLabel = nil, nil, nil, nil
+        end
+        local function viewport()
+            local camera = Workspace.CurrentCamera
+            local size = camera and camera.ViewportSize
+            if size and size.X > 0 and size.Y > 0 then return size.X, size.Y end
+            return 640, 360
+        end
+        state.viewport = viewport
+        local function ui(class, name, parent, properties)
+            local object = Instance.new(class)
+            object.Name = name
+            for key, value in pairs(properties or {}) do object[key] = value end
+            object.Parent = parent
+            return object
+        end
+        local function label(name, parent, text, size, color)
+            return ui("TextLabel", name, parent, {BackgroundTransparency = 1, BorderSizePixel = 0,
+                Font = Enum.Font.Code, Text = text, TextSize = size or 12, TextColor3 = color or colors.text,
+                TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+                TextTruncate = Enum.TextTruncate.AtEnd})
+        end
+        local function button(name, parent, text, callback)
+            local object = ui("TextButton", name, parent, {BorderSizePixel = 0, BackgroundColor3 = colors.button,
+                TextColor3 = colors.text, Font = Enum.Font.Code, TextSize = 12, Text = text,
+                AutoButtonColor = true})
+            ui("UICorner", "Corner", object, {CornerRadius = UDim.new(0, 4)})
+            connect(object.Activated, callback)
+            return object
+        end
+        local function setRect(object, x, y, width, height)
+            object.Position = UDim2.fromOffset(x, y)
+            object.Size = UDim2.fromOffset(math.max(0, width), math.max(0, height))
+        end
+        local function render()
+            state.refreshQueued = false
+            if state.stopped or not state.enabled or not state.gui or not state.panel.Visible then return end
+            local attempt = state.attempts[state.selected]
+            state.sessionLabel.Text = string.format("SESSION %02d  /  %d tentativas  /  %d registros", history.runs, #state.order, #history.lines)
+            state.resultLabel.Text = attempt and attempt.id > 0 and string.format("#%03d  %s", attempt.id, attempt.status) or "AGUARDANDO"
+            state.resultLabel.TextColor3 = resultColor(attempt)
+            state.attemptLabel.Text = attempt and attempt.id > 0 and ("#" .. string.format("%03d", attempt.id) .. "  " .. attempt.condition) or "Nenhuma tentativa"
+            local content, pageCount = "", 1
+            if state.view == "summary" then
+                content = summary(attempt)
+            else
+                local records = attempt and attempt.records or state.records
+                local visible = {}
+                for _, record in ipairs(records) do
+                    if state.view == "raw" or state.detailed or not record.trace then visible[#visible + 1] = record end
+                end
+                pageCount = math.max(1, math.ceil(#visible / state.pageSize))
+                state.page = math.clamp(state.page, 1, pageCount)
+                local output = {}
+                local first = (state.page - 1) * state.pageSize + 1
+                local last = math.min(#visible, first + state.pageSize - 1)
+                for i = first, last do
+                    local record = visible[i]
+                    local elapsed = record.time - (attempt and attempt.start or 0)
+                    if state.view == "raw" then
+                        output[#output + 1] = history.lines[record.index]
+                    else
+                        output[#output + 1] = string.format("%7.3f  %-5s  %s", elapsed, record.level, names[record.tag] or record.tag)
+                        output[#output + 1] = "         " .. (state.detailed and record.detail:gsub(";%s*", "\n         ")
+                            or eventDetail(record, attempt))
+                        output[#output + 1] = ""
+                    end
+                end
+                content = #output > 0 and table.concat(output, "\n") or "Nenhum evento nesta seleção."
+            end
+            state.pageLabel.Text = state.view == "summary" and "RESUMO" or string.format("PÁGINA %d/%d", state.page, pageCount)
+            state.pageCount = pageCount
+            state.detailButton.Text = state.detailed and "DETALHES ON" or "DETALHES OFF"
+            for key, tab in pairs(state.tabs) do
+                tab.TextColor3 = key == state.view and colors.accent or colors.muted
+                tab.BackgroundColor3 = key == state.view and colors.header or colors.window
+            end
+            if state.view ~= "raw" then content = wrap(content, math.max(16, math.floor((state.codeWidth - 10) / 7.3))) end
+            local renderKey = table.concat({tostring(state.selected), state.view, tostring(state.page), tostring(state.detailed)}, ":")
+            local resetScroll = state.renderedKey ~= renderKey
+            state.renderedKey = renderKey
+            if state.renderedText ~= content then
+                state.renderedText = content
+                state.textLabel.Text = content
+                local count, longest = 1, 0
+                for line in (content .. "\n"):gmatch("(.-)\n") do count += 1; longest = math.max(longest, #line) end
+                local height = math.max(state.codeHeight, count * 17 + 20)
+                local width = math.max(state.codeWidth, longest * 7.3 + 28)
+                state.textLabel.Size = UDim2.fromOffset(width, height)
+                state.scroll.CanvasSize = UDim2.fromOffset(width + 8, height + 8)
+                local previousScroll = state.scroll.CanvasPosition or Vector2.zero
+                state.scroll.CanvasPosition = resetScroll and Vector2.zero or Vector2.new(
+                    math.clamp(previousScroll.X, 0, math.max(0, width + 8 - state.scroll.Size.X.Offset)),
+                    math.clamp(previousScroll.Y, 0, math.max(0, height + 8 - state.scroll.Size.Y.Offset)))
+            elseif resetScroll then
+                state.scroll.CanvasPosition = Vector2.zero
+            end
+        end
+        state.refresh = render
+        local function requestRefresh()
+            if state.refreshQueued or state.stopped or not state.enabled or not state.gui then return end
+            state.refreshQueued = true
+            task.defer(function()
+                local ok, err = pcall(render)
+                if not ok then state.refreshQueued = false; status("Erro de exibição: " .. tostring(err)) end
+            end)
+        end
+        state.requestRefresh = requestRefresh
+        local function layout()
+            if not state.gui then return end
+            local vw, vh = viewport()
+            local maxWidth, maxHeight = math.max(1, vw - 20), math.max(1, vh - 20)
+            state.width = math.clamp(state.width or math.min(740, maxWidth), math.min(300, maxWidth), maxWidth)
+            state.height = math.clamp(state.height or math.min(460, maxHeight), math.min(245, maxHeight), maxHeight)
+            state.x = math.clamp(state.x or math.floor((vw - state.width) * 0.5), 10, math.max(10, vw - state.width - 10))
+            state.y = math.clamp(state.y or 24, 10, math.max(10, vh - state.height - 10))
+            setRect(state.panel, state.x, state.y, state.width, state.height)
+            local w, h = state.width, state.height
+            local short, tiny = h < 300, h < 210
+            setRect(state.header, 0, 0, w, 34)
+            setRect(state.dragHandle, 0, 0, w - 52, 34)
+            setRect(state.brand, 12, 0, w - 78, 34)
+            setRect(state.hideButton, w - 42, 6, 30, 23)
+            state.sessionLabel.Visible, state.resultLabel.Visible = not short, not short
+            state.navPrevious.Visible, state.navNext.Visible = not tiny, not tiny
+            state.attemptLabel.Visible, state.followButton.Visible = not tiny, not tiny
+            setRect(state.sessionLabel, 12, 39, w - 24, 20)
+            local actionY = short and 40 or 64
+            local actionScale = math.min(1, math.max(0.1, (w - 36) / 264))
+            setRect(state.copyButton, 12, actionY, 114 * actionScale, 28)
+            setRect(state.saveButton, 18 + 114 * actionScale, actionY, 66 * actionScale, 28)
+            setRect(state.clearButton, 24 + 180 * actionScale, actionY, 72 * actionScale, 28)
+            state.copyButton.Text = w < 300 and "COPIAR" or "COPIAR TUDO"
+            state.copyButton.TextSize = w < 300 and 10 or 12
+            state.clearButton.TextSize = w < 300 and 10 or 12
+            local navY = short and 76 or 100
+            setRect(state.navPrevious, 12, navY, 28, 25)
+            setRect(state.navNext, 44, navY, 28, 25)
+            setRect(state.attemptLabel, 80, navY, w - 161, 25)
+            setRect(state.followButton, w - 73, navY, 61, 25)
+            local tabWidth = math.min(98, (w - 24) / 3)
+            local tabY = tiny and 76 or short and 110 or 134
+            setRect(state.tabs.summary, 12, tabY, tabWidth, 27)
+            setRect(state.tabs.events, 12 + tabWidth, tabY, tabWidth, 27)
+            setRect(state.tabs.raw, 12 + tabWidth * 2, tabY, tabWidth, 27)
+            state.detailButton.Visible = w >= 480
+            setRect(state.detailButton, w - 126, tabY + 1, 114, 25)
+            setRect(state.resultLabel, 12, 166, w - 24, 20)
+            local codeY = tiny and 110 or short and 144 or 192
+            local narrow = w < 520
+            local footerHeight = narrow and 53 or 34
+            local codeHeight = math.max(0, h - codeY - footerHeight)
+            state.codeWidth, state.codeHeight = math.max(1, w - 32), codeHeight
+            setRect(state.scroll, 12, codeY, w - 24, codeHeight)
+            setRect(state.statusLabel, 12, h - 26, narrow and (w - 36) or (w - 182), 18)
+            local pageY = h - (narrow and 49 or 28)
+            setRect(state.pagePrevious, w - 164, pageY, 24, 19)
+            setRect(state.pageLabel, w - 138, pageY, 96, 19)
+            setRect(state.pageNext, w - 40, pageY, 24, 19)
+            setRect(state.resizeHandle, w - 15, h - 12, 14, 11)
+            setRect(state.toggle, math.max(8, vw - 122), math.min(58, math.max(8, vh - 40)), 110, 28)
+            state.renderedText = nil
+            requestRefresh()
+        end
+        state.layout = layout
+        local function clearHistory()
+            table.clear(history.lines)
+            state.records, state.attempts, state.order = {}, {}, {}
+            history.startedAt, history.attempts = os.clock(), 0
+            history.clears += 1
+            state.startedAt, state.attempt, state.selected, state.page = history.startedAt, 0, 0, 1
+            state.legacyNotice = nil
+            state.log("DIAG", "Histórico limpo explicitamente; aguardando eventos")
+            state.persist()
+            status("Histórico limpo por você.")
+            requestRefresh()
+        end
+        local function createGui()
+            stopGui()
+            state.gui = Instance.new("ScreenGui")
+            state.gui.Name, state.gui.ResetOnSpawn, state.gui.IgnoreGuiInset = "__Standalone_BombJump_Firefly_Diagnostics", false, true
+            state.gui.DisplayOrder, state.gui.ZIndexBehavior = 1000001, Enum.ZIndexBehavior.Sibling
+            local parentOk = pcall(function() state.gui.Parent = CoreGui end)
+            if not parentOk or not state.gui.Parent then
+                local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 3)
+                if playerGui then state.gui.Parent = playerGui end
+            end
+            if not state.gui.Parent then error("Nenhum contêiner de interface disponível") end
+            state.panel = ui("Frame", "Panel", state.gui, {BackgroundColor3 = colors.window,
+                BorderSizePixel = 0, ClipsDescendants = true, Active = true})
+            ui("UICorner", "Corner", state.panel, {CornerRadius = UDim.new(0, 7)})
+            ui("UIStroke", "Border", state.panel, {Color = colors.border, Thickness = 1})
+            state.header = ui("Frame", "Header", state.panel, {BackgroundColor3 = colors.header, BorderSizePixel = 0})
+            state.dragHandle = ui("Frame", "DragHandle", state.header, {BackgroundTransparency = 1, Active = true})
+            state.brand = label("Brand", state.dragHandle, "<> FIREFLY / DEBUGGER", 13, colors.accent)
+            state.brand.Active = true
+            state.hideButton = button("Hide", state.header, "_", function()
+                state.panel.Visible, state.toggle.Visible, state.drag = false, true, nil
+            end)
+            state.sessionLabel = label("Session", state.panel, "", 11, colors.muted)
+            state.copyButton = button("Copy", state.panel, "COPIAR TUDO", function()
+                local content, ok = state.export(), false
+                if type(setclipboard) == "function" then ok = pcall(setclipboard, content)
+                elseif type(toclipboard) == "function" then ok = pcall(toclipboard, content) end
+                local saved = state.persist()
+                status(ok and ("Histórico completo copiado: " .. #history.lines .. " registros.")
+                    or saved and ("Completo salvo em " .. state.fileName)
+                    or "Clipboard/arquivo indisponíveis; histórico mantido nesta sessão.")
+            end)
+            state.saveButton = button("Save", state.panel, ".TXT", function()
+                status(state.persist() and ("Salvo: " .. state.fileName) or "Arquivo indisponível; use COPIAR TUDO.")
+            end)
+            state.clearButton = button("Clear", state.panel, "LIMPAR", clearHistory)
+            local function select(delta)
+                local index = table.find(state.order, state.selected) or #state.order
+                state.selected = state.order[math.clamp(index + delta, 1, math.max(1, #state.order))] or 0
+                state.follow, state.page = false, 1
+                requestRefresh()
+            end
+            state.navPrevious = button("PreviousAttempt", state.panel, "<", function() select(-1) end)
+            state.navNext = button("NextAttempt", state.panel, ">", function() select(1) end)
+            state.attemptLabel = label("Attempt", state.panel, "", 12)
+            state.followButton = button("Latest", state.panel, "ÚLTIMA", function()
+                state.follow, state.selected, state.page = true, state.order[#state.order] or 0, 1
+                requestRefresh()
+            end)
+            state.tabs = {}
+            for _, tab in ipairs({{"summary", "RESUMO"}, {"events", "EVENTOS"}, {"raw", "BRUTO"}}) do
+                local key = tab[1]
+                state.tabs[key] = button("Tab_" .. key, state.panel, tab[2], function()
+                    state.view, state.page = key, 1
+                    requestRefresh()
+                end)
+            end
+            state.detailButton = button("Details", state.panel, "DETALHES OFF", function()
+                state.detailed, state.page = not state.detailed, 1
+                requestRefresh()
+            end)
+            state.resultLabel = label("Result", state.panel, "", 12, colors.blue)
+            state.scroll = ui("ScrollingFrame", "LogScroll", state.panel, {BackgroundColor3 = Color3.fromRGB(9, 13, 18),
+                BorderSizePixel = 0, ScrollBarThickness = 4, ScrollingDirection = Enum.ScrollingDirection.XY,
+                CanvasSize = UDim2.fromOffset(0, 0), ClipsDescendants = true, Active = true})
+            state.textLabel = ui("TextBox", "LogText", state.scroll, {Position = UDim2.fromOffset(8, 7),
+                BackgroundTransparency = 1, BorderSizePixel = 0, Font = Enum.Font.Code, TextSize = 12,
+                TextColor3 = colors.text, TextXAlignment = Enum.TextXAlignment.Left,
+                TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = false, MultiLine = true,
+                TextEditable = false, ClearTextOnFocus = false, Text = "", RichText = false})
+            state.statusLabel = label("Status", state.panel, state.notice or (state.legacyNotice
+                and "Importação: início do histórico antigo incompleto." or "Captura completa ativa."), 10, colors.muted)
+            state.pagePrevious = button("PreviousPage", state.panel, "<", function()
+                state.page = math.max(1, state.page - 1); requestRefresh()
+            end)
+            state.pageLabel = label("Page", state.panel, "", 10, colors.muted)
+            state.pageLabel.TextXAlignment = Enum.TextXAlignment.Center
+            state.pageNext = button("NextPage", state.panel, ">", function()
+                state.page = math.min(state.pageCount or 1, state.page + 1); requestRefresh()
+            end)
+            state.resizeHandle = button("Resize", state.panel, "/", function() end)
+            state.resizeHandle.BackgroundTransparency = 1
+            state.resizeHandle.TextColor3 = colors.muted
+            state.toggle = button("ShowDiagnostics", state.gui, "JAR DEBUG", function()
+                state.panel.Visible, state.toggle.Visible = true, false
+                layout(); requestRefresh()
+            end)
             state.toggle.Visible = false
-        end)
-        state.toggle.Visible = false
-        state.refresh()
+            state.panel.Visible = true
+            local function startDrag(input, mode)
+                if state.drag or (input.UserInputType ~= Enum.UserInputType.Touch
+                    and input.UserInputType ~= Enum.UserInputType.MouseButton1) then return end
+                state.drag = {input = input, mode = mode, start = input.Position,
+                    x = state.x, y = state.y, width = state.width, height = state.height}
+            end
+            connect(state.dragHandle.InputBegan, function(input) startDrag(input, "move") end)
+            connect(state.brand.InputBegan, function(input) startDrag(input, "move") end)
+            connect(state.resizeHandle.InputBegan, function(input) startDrag(input, "resize") end)
+            connect(UIS.InputChanged, function(input)
+                local drag = state.drag
+                if not drag then return end
+                local touch = drag.input.UserInputType == Enum.UserInputType.Touch
+                if (touch and input ~= drag.input) or (not touch and input.UserInputType ~= Enum.UserInputType.MouseMovement) then return end
+                local delta = input.Position - drag.start
+                if drag.mode == "move" then state.x, state.y = drag.x + delta.X, drag.y + delta.Y
+                else state.width, state.height = drag.width + delta.X, drag.height + delta.Y end
+                layout()
+            end)
+            connect(UIS.InputEnded, function(input)
+                local drag = state.drag
+                if drag and (input == drag.input or (drag.input.UserInputType == Enum.UserInputType.MouseButton1
+                    and input.UserInputType == Enum.UserInputType.MouseButton1)) then state.drag = nil end
+            end)
+            pcall(function() connect(UIS.WindowFocusReleased, function() state.drag = nil end) end)
+            pcall(function() connect(state.gui:GetPropertyChangedSignal("AbsoluteSize"), layout) end)
+            layout()
+        end
+        state.beginAttempt = function()
+            history.attempts += 1
+            state.attempt = history.attempts
+            if state.follow then state.selected, state.page = state.attempt, 1 end
+        end
+        state.log = function(tag, detail)
+            local name = tostring(tag)
+            if state.stopped or not state.enabled or name:sub(1, 5) == "BOMB_" or name:sub(1, 7) == "NORMAL_"
+                or name:sub(1, 8) == "BLATANT_" or name == "THROW" or name == "HAND" or name == "FLOOR"
+                or name == "JUMP_SETTINGS" or name == "NO_BOMB_OBSERVED" then return end
+            local line = string.format("+%.3fs | %s | attempt=%d%s", os.clock() - state.startedAt, name, state.attempt or 0,
+                detail ~= nil and ("; " .. tostring(detail)) or "")
+            history.lines[#history.lines + 1] = line
+            ingest(line, state.attempt)
+            requestRefresh()
+            if (name == "ATTEMPT_FINISH" or name == "PLAYER_UNLOCK_DONE" or name == "ACTIVATION_FAILED"
+                or name == "ACTIVATION_ERROR") and not state.persistQueued then
+                state.persistQueued = true
+                task.defer(function() state.persistQueued = false; state.persist() end)
+            end
+        end
+        state.setEnabled = function(value)
+            state.enabled = value == true
+            if state.enabled and not state.gui then
+                local ok, err = pcall(createGui)
+                if not ok then
+                    stopGui()
+                    state.guiError = tostring(err)
+                    warn("[Firefly diagnostic UI] " .. tostring(err))
+                end
+            end
+            if state.gui then state.gui.Enabled = state.enabled end
+            if state.enabled and not state.runAnnounced then
+                state.runAnnounced = true
+                state.log("DIAG_SESSION", string.format("build=%s; execution=%d; retained=%d; automaticTruncation=false; place=%s; job=%s",
+                    state.build, history.runs, #history.lines, tostring(game.PlaceId), tostring(game.JobId)))
+            end
+            if state.enabled then requestRefresh() end
+        end
+        sharedEnv.__StandaloneBombJumpFireflyDiagnosticsCleanup = function()
+            state.stopped = true
+            stopGui()
+            task.defer(function() state.persist() end)
+        end
     end
-
-    pcall(createGui)
-    sharedEnv.__StandaloneBombJumpFireflyDiagnosticsCleanup = function()
-        pcall(function()
-            if fireflyDiag.gui then fireflyDiag.gui:Destroy() end
-        end)
+    local ok, err = pcall(initialize)
+    if not ok then
+        state.initError = tostring(err)
+        state.log = function() end
+        state.beginAttempt = function() end
+        state.setEnabled = function() end
+        state.persist = function() return false end
+        warn("[Firefly diagnostics initialization] " .. tostring(err))
     end
-    fireflyDiag.log("SCRIPT", "v29 loaded; walking target velocity accepted up to 24 studs/s; lead bounded to 8.4; takeoff release retained")
 end
 
 local Config = {
@@ -233,7 +660,7 @@ local Config = {
     BOMB_HIGH_PING_FORWARD_MIN = 0.35,
     BOMB_HIGH_PING_FORWARD_SCALE = 4.0,
     BOMB_HIGH_PING_THRESHOLD = 0.10,
-    BOMB_LAUNCH_FALL_SPEED = 18,
+    BOMB_LAUNCH_FALL_SPEED = 1.0,
     BOMB_MAX_HORIZONTAL_PREDICTION = 0.18,
     BOMB_MAX_SURFACE_RISE = 0.30,
     BOMB_PREDICTION_INPUT_BASE = 0.008,
@@ -254,6 +681,8 @@ local Config = {
     FIREFLY_FIRST_JUMP_HOLD_TIME = 0.55,
     FIREFLY_FIRST_JUMP_RETURN_RATIO = 0.15,
     FIREFLY_FORWARD_HOLD_TIME = 0.55,
+    FIREFLY_FORWARD_MAX_HOLD_TIME = 1.25,
+    FIREFLY_SECOND_JUMP_CONFIRM_TIME = 0.35,
     FIREFLY_LID_APPROACH_CLEARANCE = 0.12,
     FIREFLY_FORWARD_MOVEMENT_BIND_NAME = "__BombJumpFireflyForwardMovement",
     FIREFLY_JUMP_INPUT_LOCK_NAME = "__BombJumpFireflyJumpInputLock",
@@ -612,6 +1041,7 @@ do
     bombUseMode = activeTypeSettings.UsageMode
     savedBombSettings.BombStyle = activeTypeSettings.Style
 end
+fireflyDiag.setEnabled(selectedBombType == "Firefly Jar")
 local noGuiTimerBomb = savedBoolean("HideGuiTimer", false)
 local showBombJumpGui = savedBoolean("ShowBombJumpButton", false)
 local lockBombPosition = savedBoolean("LockBombPosition", false)
@@ -1259,6 +1689,7 @@ makeDropdownSelector("Bomb Type", selectedBombType, typeOptions, function(newTyp
     currentTypeSettings.Style = savedBombSettings.BombStyle or currentTypeSettings.Style or "Legit"
 
     selectedBombType = newType
+    fireflyDiag.setEnabled(selectedBombType == "Firefly Jar")
     local nextTypeSettings = typeSettingsMap[selectedBombType]
     if type(nextTypeSettings) ~= "table" then
         nextTypeSettings = {UsageMode = "Click To Use Bomb", Style = "Legit"}
@@ -1618,20 +2049,31 @@ local function getBombToolName()
     return "FakeBomb"
 end
 
-local BombStyleRuntime = {
-    FreefallReleaseDelay = 0.10,
-}
+local BombStyleRuntime = {}
+
+BombStyleRuntime.isDescending = function(humanoid, rootPart)
+    if not humanoid or not rootPart or humanoid.Health <= 0 then
+        return false
+    end
+    local state = humanoid:GetState()
+    return (state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.FallingDown)
+        and rootPart.AssemblyLinearVelocity.Y <= -Config.BOMB_LAUNCH_FALL_SPEED
+end
 
 BombStyleRuntime.usesInstantFreefallLaunch = function()
-    return selectedBombType ~= "Firefly Jar"
-        and savedBombSettings.BombStyle == "Blatant"
+    -- Both styles use the validated Legit dispatch path; only the bounce differs.
+    return false
+end
+
+BombStyleRuntime.usesRelativeBombThrow = function()
+    return selectedBombType == "Bomb"
 end
 
 
 local function snapshotExistingFireflyLids()
     local snapshot = {}
     for _, instance in ipairs(Workspace:GetChildren()) do
-        if instance.Name == "Handle2" and instance:IsA("Part") then
+        if instance.Name == "Handle2" and instance:IsA("BasePart") then
             snapshot[instance] = true
         end
     end
@@ -1950,9 +2392,27 @@ local function getBombThrowTarget(character, rootPart, humanoid, bombTool, playe
     local horizontalSpeed = horizontalVelocity.Magnitude
     local verticalVelocity = velocity.Y
     local state = humanoid:GetState()
+    local isStationary = horizontalSpeed <= 0.75
+    local aimDirection = flatLook
+    local throwDirection = flatLook
+    local relativeThrow = BombStyleRuntime.usesRelativeBombThrow()
+    if isStationary then
+        horizontalVelocity = Vector3.zero
+        -- Keep the previously working remote orientation until its server semantics are measured.
+        throwDirection = flatLook
+    else
+        local movementDirection = horizontalVelocity.Unit
+        if relativeThrow or movementDirection:Dot(flatLook) <= 0.001 then
+            -- Shift Lock can keep the body facing away from its actual travel.
+            aimDirection = movementDirection
+            throwDirection = movementDirection
+        end
+    end
 
     local isFreefall = state == Enum.HumanoidStateType.Freefall
-    local isFalling = forceBelowFeet == true or (isFreefall and verticalVelocity < -1)
+        or state == Enum.HumanoidStateType.FallingDown
+    local isFalling = forceBelowFeet == true
+        or (isFreefall and verticalVelocity <= -Config.BOMB_LAUNCH_FALL_SPEED)
 
     if isFalling then
         local oneWayLatency = getBombOneWayLatency(player)
@@ -1979,8 +2439,7 @@ local function getBombThrowTarget(character, rootPart, humanoid, bombTool, playe
             7.50
         )
 
-        local aimDirection = flatLook
-        local forwardDistance = forceBelowFeet and 0 or math.clamp(
+        local forwardDistance = (relativeThrow or forceBelowFeet or isStationary) and 0 or math.clamp(
             1.50 + horizontalSpeed * 0.004,
             1.15,
             1.65
@@ -2000,7 +2459,8 @@ local function getBombThrowTarget(character, rootPart, humanoid, bombTool, playe
             and math.max(0.5, targetBodyMaximumY - targetBodyMinimumY)
             or 1
         local targetBodyBottomY = targetXZ.Y - targetBodyHeight
-        local groundRayOriginY = predictedFootBottomY + Config.BOMB_FREEFALL_GROUND_RAY_MARGIN
+        local groundRayOriginY = math.max(footBottomY, predictedFootBottomY)
+            + Config.BOMB_FREEFALL_GROUND_RAY_MARGIN
         local groundRayLength = math.max(
             Config.BOMB_FREEFALL_GROUND_RAY_MARGIN,
             groundRayOriginY - targetBodyBottomY + Config.BOMB_FREEFALL_GROUND_RAY_MARGIN
@@ -2014,7 +2474,7 @@ local function getBombThrowTarget(character, rootPart, humanoid, bombTool, playe
         )
         local targetY = targetXZ.Y
         local targetIsGroundSurface = false
-        if groundResult and groundResult.Position.Y < predictedFootBottomY then
+        if groundResult and groundResult.Position.Y < math.max(footBottomY, predictedFootBottomY) then
             local groundTargetY = groundResult.Position.Y + Config.BOMB_GROUND_SINK
             if groundResult.Position.Y > targetBodyBottomY then
                 targetY = groundTargetY
@@ -2022,10 +2482,9 @@ local function getBombThrowTarget(character, rootPart, humanoid, bombTool, playe
             end
         end
 
-        return Vector3.new(targetXZ.X, targetY, targetXZ.Z), targetIsGroundSurface
+        return Vector3.new(targetXZ.X, targetY, targetXZ.Z), targetIsGroundSurface, throwDirection
     end
 
-    local isStationary = horizontalSpeed <= 0.75 and humanoid.MoveDirection.Magnitude <= 0.05
     local ping = getBombPing(player)
     local highPingForward = 0
 
@@ -2049,7 +2508,7 @@ local function getBombThrowTarget(character, rootPart, humanoid, bombTool, playe
         )
     end
 
-    return (rootPart.CFrame * CFrame.new(0, -3, -forwardDistance)).Position
+    return rootPart.Position + Vector3.new(0, -3, 0) + aimDirection * forwardDistance, nil, throwDirection
 end
 
 local function fireBombRemote(bombTool, character, rootPart, humanoid, player, forceBelowFeet)
@@ -2062,7 +2521,7 @@ local function fireBombRemote(bombTool, character, rootPart, humanoid, player, f
         return false, nil
     end
 
-    local targetPosition = getBombThrowTarget(character, rootPart, humanoid, bombTool, player, forceBelowFeet)
+    local targetPosition, _, throwDirection = getBombThrowTarget(character, rootPart, humanoid, bombTool, player, forceBelowFeet)
     if not targetPosition then
         return false, nil
     end
@@ -2075,14 +2534,99 @@ local function fireBombRemote(bombTool, character, rootPart, humanoid, player, f
         flatLook = flatLook.Unit
     end
 
-    local throwCFrame = CFrame.lookAt(targetPosition, targetPosition + flatLook)
+    local throwCFrame = CFrame.lookAt(targetPosition, targetPosition + (throwDirection or flatLook))
     local throwForce = 50
+    local relativeThrow = BombStyleRuntime.usesRelativeBombThrow()
+    if relativeThrow then
+        local v = rootPart.AssemblyLinearVelocity
+        local speed = Vector3.new(v.X, 0, v.Z).Magnitude
+        throwForce = speed <= 0.75 and 0 or math.clamp(speed, 0, 50)
+    end
+    local sentAt = os.clock()
+    local trace = {sentAt = sentAt, target = targetPosition, observed = false,
+        rootPosition = rootPart.Position, velocity = rootPart.AssemblyLinearVelocity,
+        state = humanoid:GetState(), force = throwForce, relativeThrow = relativeThrow,
+        jumpPower = humanoid.JumpPower, jumpHeight = humanoid.JumpHeight,
+        useJumpPower = humanoid.UseJumpPower}
 
     local ok = pcall(function()
         remote:FireServer(throwCFrame, throwForce)
     end)
 
+    BombStyleRuntime.latestTrace = trace
+    task.defer(function()
+        if fireflyDiag.stopped then return end
+        pcall(function()
+            local latency, effectivePing = getBombOneWayLatency(player)
+            local v = trace.velocity
+            local p = trace.rootPosition
+            local hand = character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm")
+            fireflyDiag.log("THROW", string.format(
+                "localDispatch=%s; style=%s; effectiveRTT=%.0fms; prediction=%.0fms; state=%s; root=(%.2f,%.2f,%.2f); v=(%.2f,%.2f,%.2f); target=(%.2f,%.2f,%.2f); look=(%.3f,%.3f,%.3f); arg2=%.3f; relativeThrow=%s",
+                tostring(ok), tostring(savedBombSettings.BombStyle), effectivePing*1000, latency*1000,
+                tostring(trace.state), p.X,p.Y,p.Z, v.X,v.Y,v.Z,
+                targetPosition.X,targetPosition.Y,targetPosition.Z,
+                throwCFrame.LookVector.X,throwCFrame.LookVector.Y,throwCFrame.LookVector.Z,
+                trace.force,tostring(trace.relativeThrow)))
+            fireflyDiag.log("JUMP_SETTINGS", string.format("UseJumpPower=%s; JumpPower=%s; JumpHeight=%s",
+                tostring(trace.useJumpPower),tostring(trace.jumpPower),tostring(trace.jumpHeight)))
+            if hand and hand:IsA("BasePart") then
+                local h = hand.Position
+                fireflyDiag.log("HAND", string.format("(%.2f,%.2f,%.2f)",h.X,h.Y,h.Z))
+            end
+        end)
+    end)
+
     return ok, targetPosition
+end
+
+BombStyleRuntime.traceBomb = function(trace, part, character, rootPart)
+    if not trace or trace.observed or not part or not part.Parent then return end
+    trace.observed = true
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local firstPosition = part.Position
+    local firstVelocity = part.AssemblyLinearVelocity
+    local firstAt = os.clock() - trace.sentAt
+    task.defer(function()
+        if fireflyDiag.stopped then return end
+        pcall(function()
+            local creator = part:FindFirstChild("creator")
+            fireflyDiag.log("BOMB_CANDIDATE", string.format(
+                "dt=%.3fs; path=%s; creator=%s; pos=(%.2f,%.2f,%.2f); v=(%.2f,%.2f,%.2f); targetError=%.2f",
+                firstAt, part:GetFullName(), tostring(creator and creator.Value),
+                firstPosition.X,firstPosition.Y,firstPosition.Z,
+                firstVelocity.X,firstVelocity.Y,firstVelocity.Z,(firstPosition-trace.target).Magnitude))
+            fireflyDiag.log("BOMB_PROPERTIES", string.format("size=(%.2f,%.2f,%.2f); anchored=%s; collide=%s; observedHorizontalSpeed=%.3f; sentArg2=%.3f",
+                part.Size.X,part.Size.Y,part.Size.Z,tostring(part.Anchored),tostring(part.CanCollide),
+                Vector3.new(firstVelocity.X,0,firstVelocity.Z).Magnitude,trace.force))
+            local floor = raycastGroundAt(character, part, firstPosition,
+                math.max(trace.rootPosition.Y,firstPosition.Y)+4,100)
+            if floor then
+                fireflyDiag.log("FLOOR", string.format("surfaceY=%.3f; partCenterY=%.3f; targetY=%.3f",
+                    floor.Position.Y,firstPosition.Y,trace.target.Y))
+            end
+        end)
+        for _,elapsed in ipairs({0.05,0.15,0.30,0.60}) do
+            local remaining = trace.sentAt + elapsed - os.clock()
+            if remaining > 0 then task.wait(remaining) end
+            if fireflyDiag.stopped or character ~= LocalPlayer.Character or not rootPart.Parent then return end
+            if not part.Parent then
+                fireflyDiag.log("BOMB_REMOVED", string.format("observed at +%.3fs; does not prove explosion",os.clock()-trace.sentAt))
+                return
+            end
+            pcall(function()
+                local p = part.Position
+                local _,feetY = getFootData(character,rootPart)
+                local v = rootPart.AssemblyLinearVelocity
+                local r = rootPart.Position
+                local bv = part.AssemblyLinearVelocity
+                fireflyDiag.log("BOMB_SAMPLE", string.format(
+                    "dt=%.3fs; pos=(%.2f,%.2f,%.2f); bombV=(%.2f,%.2f,%.2f); feetY=%.2f; root=(%.2f,%.2f,%.2f); rootV=(%.2f,%.2f,%.2f); state=%s; floor=%s",
+                    os.clock()-trace.sentAt,p.X,p.Y,p.Z,bv.X,bv.Y,bv.Z,feetY,r.X,r.Y,r.Z,
+                    v.X,v.Y,v.Z,tostring(humanoid and humanoid:GetState()),tostring(humanoid and humanoid.FloorMaterial)))
+            end)
+        end
+    end)
 end
 
 local bombMouseOverride = sharedEnv.__StandaloneBombJumpMouseOverride
@@ -2580,6 +3124,22 @@ local function getFireflyArmLateralPosition(shoulder, armPart)
     return (armPart.Position - torso.Position):Dot(torso.CFrame.RightVector)
 end
 
+local function getFireflyRootHeight(character, humanoid, rootPart)
+    local height = humanoid.HipHeight + rootPart.Size.Y * 0.5
+    if not character:FindFirstChild("LowerTorso") then
+        local leg = character:FindFirstChild("Left Leg") or character:FindFirstChild("Right Leg")
+        if leg and leg:IsA("BasePart") then height = height + leg.Size.Y end
+    end
+    return height
+end
+
+local function getFireflyJumpConfirmationSpeed(humanoid)
+    local speed = humanoid.UseJumpPower and humanoid.JumpPower
+        or math.sqrt(math.max(0, 2 * Workspace.Gravity * humanoid.JumpHeight))
+    return math.max(2, speed * 0.4)
+end
+
+
 local function holdFireflyJump(humanoid, character, duration, sharedDeadline)
     if fireflyDoubleJumpJumpConnection then
         fireflyDoubleJumpJumpConnection:Disconnect()
@@ -2615,6 +3175,16 @@ local function stopFireflyForwardMovement()
 end
 
 local function startFireflyForwardMovement(character, humanoid, rootPart, movementStartAt, onWindowStarted, onWindowEnded, onFailure)
+    local function getFireflyLandingTime(feetGap, relativeVerticalVelocity, gravity)
+        -- Keep the signed gap: feet already below the top are not a zero-height landing.
+        -- A valid solution must cross the top while descending relative to the lid.
+        local discriminant = relativeVerticalVelocity * relativeVerticalVelocity + 2 * gravity * feetGap
+        if discriminant < 0 then return nil end
+        local time = (relativeVerticalVelocity + math.sqrt(discriminant)) / gravity
+        if time < 0 or relativeVerticalVelocity - gravity * time > 0 then return nil end
+        return time
+    end
+
     stopFireflyForwardMovement()
 
     local startAt = movementStartAt or os.clock()
@@ -2671,12 +3241,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                     local dz = traceRootPosition.Z - traceLidPosition.Z
                     horizontalDistance = math.sqrt(dx * dx + dz * dz)
 
-                    local expectedRootHeight = humanoid.HipHeight + rootPart.Size.Y * 0.5
-                    if not character:FindFirstChild("LowerTorso") then
-                        local leftLeg = character:FindFirstChild("Left Leg")
-                        expectedRootHeight = (leftLeg and leftLeg:IsA("BasePart") and leftLeg.Size.Y or humanoid.HipHeight)
-                            + rootPart.Size.Y * 0.5
-                    end
+                    local expectedRootHeight = getFireflyRootHeight(character, humanoid, rootPart)
                     feetGap = traceRootPosition.Y - expectedRootHeight
                         - (traceLidPosition.Y + traceLid.Size.Y * 0.5)
 
@@ -2755,7 +3320,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 measuredLowSpeedSamples = 0
             else
                 local sampleDt = now - velocitySampleAt
-                if sampleDt >= 0.06 and sampleDt <= 0.20 then
+                if sampleDt >= 0.03 and sampleDt <= 0.20 then
                     local observedVelocity = (lid.Position - velocitySamplePosition) / sampleDt
                     if observedVelocity.Magnitude <= 100 then
                         measuredLidVelocity = observedVelocity
@@ -2784,11 +3349,9 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 end
             end
 
-            -- Prefer observed displacement when it shows meaningful movement. However, the
-            -- walking trace showed the lid accelerating between position samples: the measured
-            -- displacement briefly returned zero while an unanchored lid's reported velocity
-            -- already indicated motion. In that narrow case, use reported horizontal velocity
-            -- provisionally; anchored lids continue to rely only on observed displacement.
+            -- The lateral failure reported 14 studs/s while the visible/collidable lid
+            -- stayed at the same position. An uncorroborated assembly report must not
+            -- drag the character towards a future position that has not been observed.
             local measuredHorizontalVelocity = Vector3.new(
                 measuredLidVelocity.X, 0, measuredLidVelocity.Z
             )
@@ -2796,39 +3359,20 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 reportedLidVelocity.X, 0, reportedLidVelocity.Z
             )
             local reportedHorizontalSpeed = reportedHorizontalVelocity.Magnitude
-            -- Later traces measured 19-20.5 studs/s, confirming that prior reports above
-            -- 18 were real lid motion rather than spikes. Accept reported velocity up to 24
-            -- studs/s provisionally; observed displacement takes over when valid, and larger
-            -- reports are still rejected as implausible.
             local measuredHorizontalSpeed = measuredHorizontalVelocity.Magnitude
             local reportedVelocityIsPlausible = reportedHorizontalSpeed >= 1.25
                 and reportedHorizontalSpeed <= 24.0
-            local measuredLooksTemporarilyStale = measuredLidVelocityValid
-                and measuredHorizontalSpeed <= 1.0
-                and measuredLowSpeedSamples <= 1
-            local useReportedHorizontalVelocity = not lid.Anchored
-                and reportedVelocityIsPlausible
-                and (not measuredLidVelocityValid or measuredLooksTemporarilyStale)
             local horizontalLidVelocity = Vector3.zero
-            local horizontalVelocitySource = "zero"
-            if useReportedHorizontalVelocity then
-                horizontalLidVelocity = reportedHorizontalVelocity
-                horizontalVelocitySource = "reported"
-            elseif measuredLidVelocityValid then
+            local horizontalVelocitySource = "awaiting-position-sample"
+            if measuredLidVelocityValid then
                 horizontalLidVelocity = measuredHorizontalVelocity
                 horizontalVelocitySource = "measured"
             end
-            -- AssemblyLinearVelocity.Y can spike independently of observed displacement.
-            -- Select vertical speed AFTER updating the displacement sample this frame.
-            -- Traces included >100 stud/s reports while the lid moved only slightly.
-            local selectedLidVerticalVelocity = reportedLidVelocity.Y
-            local lidVerticalVelocitySource = "reported"
-            if measuredLidVelocityValid and math.abs(measuredLidVelocity.Y) <= 60.0 then
+            local selectedLidVerticalVelocity = 0
+            local lidVerticalVelocitySource = "awaiting-position-sample"
+            if measuredLidVelocityValid then
                 selectedLidVerticalVelocity = measuredLidVelocity.Y
                 lidVerticalVelocitySource = "measured"
-            elseif math.abs(reportedLidVelocity.Y) > 60.0 then
-                selectedLidVerticalVelocity = 0
-                lidVerticalVelocitySource = "zero-clamped"
             end
 
             local lidVelocity = Vector3.new(
@@ -2841,31 +3385,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 and bottomGap <= 0.18
                 and lidVelocity.Magnitude <= 1.5
 
-            if not deadline then
-                deadline = now + Config.FIREFLY_FORWARD_HOLD_TIME
-                if onWindowStarted then
-                    onWindowStarted(deadline)
-                end
-            end
-
-            if now >= deadline then
-                pcall(function()
-                    humanoid:Move(Vector3.zero, false)
-                end)
-                stopFireflyForwardMovement()
-                if onWindowEnded then
-                    onWindowEnded()
-                end
-                return
-            end
-
-            local lowerTorso = character:FindFirstChild("LowerTorso")
-            local rootHeightAboveGround = humanoid.HipHeight + rootPart.Size.Y * 0.5
-            if not lowerTorso then
-                local leftLeg = character:FindFirstChild("Left Leg")
-                rootHeightAboveGround = (leftLeg and leftLeg:IsA("BasePart") and leftLeg.Size.Y or humanoid.HipHeight)
-                    + rootPart.Size.Y * 0.5
-            end
+            local rootHeightAboveGround = getFireflyRootHeight(character, humanoid, rootPart)
 
             local lidTopY = lid.Position.Y + lid.Size.Y * 0.5
             local feetGap = rootPart.Position.Y - rootHeightAboveGround - lidTopY
@@ -2873,20 +3393,27 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             local verticalVelocity = rootVelocity.Y
             local relativeVerticalVelocity = verticalVelocity - lidVelocity.Y
             local gravity = math.max(Workspace.Gravity, 1)
-            local landingDiscriminant = math.max(
-                0,
-                relativeVerticalVelocity * relativeVerticalVelocity
-                    + 2 * gravity * math.max(feetGap, 0)
-            )
-            local predictedLandingTime = (
-                relativeVerticalVelocity + math.sqrt(landingDiscriminant)
-            ) / gravity
-            predictedLandingTime = math.clamp(predictedLandingTime, 0, 0.35)
+            local expectedLandingTime = getFireflyLandingTime(feetGap, relativeVerticalVelocity, gravity)
+            local landingReachable = expectedLandingTime ~= nil
+            local predictedLandingTime = landingReachable and math.clamp(expectedLandingTime, 0, 0.35) or 0
 
-            -- Bound the lead to the revised plausible horizontal speed ceiling
-            -- (24 studs/s) times the maximum landing horizon (0.35 s): 24 * 0.35 = 8.4.
-            -- This allows the initial prediction to account for the fastest observed target
-            -- motion without extrapolating beyond the accepted speed range.
+            if not deadline then
+                local holdTime = math.clamp((expectedLandingTime or 0) + Config.FIREFLY_SECOND_JUMP_CONFIRM_TIME,
+                    Config.FIREFLY_FORWARD_HOLD_TIME, Config.FIREFLY_FORWARD_MAX_HOLD_TIME)
+                deadline = now + holdTime
+                fireflyDiag.log("MOVE_WINDOW_BEGIN", string.format("landingEstimate=%s; hold=%.3f",
+                    expectedLandingTime and string.format("%.3f", expectedLandingTime) or "no descending intersection", holdTime))
+                if onWindowStarted then onWindowStarted(deadline) end
+            end
+            if now >= deadline then
+                pcall(function() humanoid:Move(Vector3.zero, false) end)
+                stopFireflyForwardMovement()
+                if onWindowEnded then onWindowEnded() end
+                return
+            end
+
+            -- Keep the existing 8.4-stud lead bound even when a position update
+            -- briefly reports a much faster displacement.
             local leadOffset = horizontalLidVelocity * predictedLandingTime
             if leadOffset.Magnitude > 8.4 then
                 leadOffset = leadOffset.Unit * 8.4
@@ -2897,8 +3424,6 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             local horizontalRootVelocity = Vector3.new(rootVelocity.X, 0, rootVelocity.Z)
             local relativeHorizontalVelocity = horizontalRootVelocity - horizontalLidVelocity
             local rootLeadTime = math.min(predictedLandingTime, 0.08)
-            local predictedRootControlPosition = rootPart.Position
-                + horizontalRootVelocity * rootLeadTime
             local predictedRootLandingPosition = rootPart.Position
                 + horizontalRootVelocity * predictedLandingTime
             local predictedRootAtLanding = Vector3.new(
@@ -2907,9 +3432,9 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 predictedRootLandingPosition.Z
             )
             local horizontalOffset = Vector3.new(
-                predictedLidPosition.X - predictedRootControlPosition.X,
+                lid.Position.X - rootPart.Position.X,
                 0,
-                predictedLidPosition.Z - predictedRootControlPosition.Z
+                lid.Position.Z - rootPart.Position.Z
             )
             local predictedLocalPosition = predictedLidCFrame:PointToObjectSpace(predictedRootAtLanding)
             local safeHalfX = math.max(
@@ -2922,7 +3447,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             )
             local predictedWithinLandingFootprint = math.abs(predictedLocalPosition.X) <= safeHalfX
                 and math.abs(predictedLocalPosition.Z) <= safeHalfZ
-            local descendingIntoLid = relativeVerticalVelocity <= -1.0
+            local descendingIntoLid = landingReachable and relativeVerticalVelocity <= -1.0
                 and feetGap >= -0.25
                 and feetGap <= 2.2
                 and predictedWithinLandingFootprint
@@ -2931,16 +3456,16 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             local direction = Vector3.zero
             local captureRadius = math.clamp(math.min(lid.Size.X, lid.Size.Z) * 0.12, 0.16, 0.32)
             local remainingLandingTime = math.max(predictedLandingTime - rootLeadTime, 0.08)
-            local desiredRelativeVelocity = horizontalOffset / remainingLandingTime
+            -- Work in the lid's moving reference frame. The future lid displacement
+            -- is already represented by its velocity; do not add that lead twice.
+            local desiredRelativeVelocity = (horizontalOffset - relativeHorizontalVelocity * rootLeadTime)
+                / remainingLandingTime
             local maximumCorrectionSpeed = math.max(humanoid.WalkSpeed, 1)
             if desiredRelativeVelocity.Magnitude > maximumCorrectionSpeed then
                 desiredRelativeVelocity = desiredRelativeVelocity.Unit * maximumCorrectionSpeed
             end
-            -- Humanoid:Move consumes a desired movement vector. Convert the relative
-            -- interception velocity into world-space movement before creating that vector;
-            -- using (desired-relative velocity minus current velocity) directly as Move input
-            -- can under-command the final correction as the landing window shrinks.
             local desiredWorldVelocity = horizontalLidVelocity + desiredRelativeVelocity
+            local requestedWorldSpeed = desiredWorldVelocity.Magnitude
             if desiredWorldVelocity.Magnitude > maximumCorrectionSpeed then
                 desiredWorldVelocity = desiredWorldVelocity.Unit * maximumCorrectionSpeed
             end
@@ -2948,7 +3473,10 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 and predictedWithinLandingFootprint
                 and relativeHorizontalVelocity.Magnitude <= 1.15
 
-            if not canSettleOnLid then
+            if canSettleOnLid then
+                direction = horizontalLidVelocity / maximumCorrectionSpeed
+                if direction.Magnitude > 1 then direction = direction.Unit end
+            else
                 if desiredWorldVelocity.Magnitude > 0.08 then
                     direction = desiredWorldVelocity / maximumCorrectionSpeed
                 elseif horizontalOffset.Magnitude > captureRadius and not predictedWithinLandingFootprint then
@@ -2961,12 +3489,10 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
 
             if feetGap < Config.FIREFLY_LID_APPROACH_CLEARANCE then
                 if predictedWithinLandingFootprint then
-                    -- Brake only after the projected landing point is inside the safe footprint.
-                    local brakingDirection = -relativeHorizontalVelocity
-                    if brakingDirection.Magnitude > maximumCorrectionSpeed then
-                        brakingDirection = brakingDirection.Unit * maximumCorrectionSpeed
-                    end
-                    direction = brakingDirection / maximumCorrectionSpeed
+                    -- Move is a target movement, not an acceleration command. Match
+                    -- the support's velocity instead of commanding a backwards walk.
+                    direction = horizontalLidVelocity / maximumCorrectionSpeed
+                    if direction.Magnitude > 1 then direction = direction.Unit end
                 else
                     -- Still outside the safe footprint at low altitude: keep the full
                     -- target-interception command rather than a reduced velocity-error delta.
@@ -2981,7 +3507,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             if now >= nextAutoTraceAt then
                 nextAutoTraceAt = now + 0.10
                 fireflyDiag.log("AUTO_TRACE", string.format(
-                    "state=%s; root=(%.2f,%.2f,%.2f); lid=(%.2f,%.2f,%.2f); feetGap=%.2f; landingT=%.3f; remainingT=%.3f; offset=(%.2f,%.2f); desiredWorldV=(%.2f,%.2f); dir=(%.3f,%.3f); rootV=(%.2f,%.2f); lidV=(%.2f,%.2f); lidReportedV=(%.2f,%.2f); lidReportedSpeed=%.2f; reportPlausible=%s; lidVy=%.2f; lidReportedVy=%.2f; lidVelocityYSource=%s; measuredSpeed=%.2f; lowSamples=%d; lidAnchored=%s; lidVelocitySource=%s; lidVelocityMeasured=%s; local=(%.2f,%.2f); footprint=%s; descending=%s; settle=%s; floor=%s",
+                    "state=%s; root=(%.2f,%.2f,%.2f); lid=(%.2f,%.2f,%.2f); feetGap=%.2f; landingT=%.3f; remainingT=%.3f; offset=(%.2f,%.2f); desiredWorldV=(%.2f,%.2f); dir=(%.3f,%.3f); rootV=(%.2f,%.2f); lidV=(%.2f,%.2f); lidReportedV=(%.2f,%.2f); lidReportedSpeed=%.2f; reportPlausible=%s; lidVy=%.2f; lidReportedVy=%.2f; lidVelocityYSource=%s; measuredSpeed=%.2f; lowSamples=%d; lidAnchored=%s; lidVelocitySource=%s; lidVelocityMeasured=%s; local=(%.2f,%.2f); footprint=%s; descending=%s; settle=%s; floor=%s; requestedSpeed=%.2f; speedLimit=%.2f; facing=(%.2f,%.2f); windowLeft=%.3f; landingReachable=%s; rootVy=%.2f; lidSize=(%.2f,%.2f,%.2f); lidUp=(%.2f,%.2f,%.2f)",
                     tostring(currentState),
                     rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z,
                     lid.Position.X, lid.Position.Y, lid.Position.Z,
@@ -2999,7 +3525,10 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                     tostring(measuredLidVelocityValid),
                     predictedLocalPosition.X, predictedLocalPosition.Z,
                     tostring(predictedWithinLandingFootprint), tostring(descendingIntoLid),
-                    tostring(canSettleOnLid), tostring(humanoid.FloorMaterial)
+                    tostring(canSettleOnLid), tostring(humanoid.FloorMaterial), requestedWorldSpeed, maximumCorrectionSpeed,
+                    rootPart.CFrame.LookVector.X, rootPart.CFrame.LookVector.Z, math.max(0,deadline-now),
+                    tostring(landingReachable), verticalVelocity, lid.Size.X, lid.Size.Y, lid.Size.Z,
+                    lid.CFrame.UpVector.X, lid.CFrame.UpVector.Y, lid.CFrame.UpVector.Z
                 ))
             end
         end
@@ -3092,52 +3621,62 @@ sharedEnv.__StandaloneBombJumpFireflyCleanup = function()
     end)
 end
 
-local function getFireflyArmRotationVector(shoulder)
-    if not shoulder or not shoulder:IsA("Motor6D") then
-        return nil
+-- Keep unused legacy angle helpers outside the root chunk's live-local budget.
+do
+    local function getFireflyArmRotationVector(shoulder)
+        if not shoulder or not shoulder:IsA("Motor6D") then
+            return nil
+        end
+
+        local x, y, z = shoulder.Transform:ToOrientation()
+        return Vector3.new(x, y, z)
     end
 
-    local x, y, z = shoulder.Transform:ToOrientation()
-    return Vector3.new(x, y, z)
-end
-
-local function wrapAngle(angle)
-    return math.atan2(math.sin(angle), math.cos(angle))
-end
-
-local function getAngularComponent(rotation, baseline, axis)
-    if not rotation or not baseline then
-        return nil
+    local function wrapAngle(angle)
+        return math.atan2(math.sin(angle), math.cos(angle))
     end
 
-    if axis == 1 then
-        return wrapAngle(rotation.X - baseline.X)
-    elseif axis == 2 then
-        return wrapAngle(rotation.Y - baseline.Y)
+    local function getAngularComponent(rotation, baseline, axis)
+        if not rotation or not baseline then
+            return nil
+        end
+
+        if axis == 1 then
+            return wrapAngle(rotation.X - baseline.X)
+        elseif axis == 2 then
+            return wrapAngle(rotation.Y - baseline.Y)
+        end
+        return wrapAngle(rotation.Z - baseline.Z)
     end
-    return wrapAngle(rotation.Z - baseline.Z)
 end
 
 local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, preExistingLids, activationState)
     cancelFireflyDoubleJump()
+    if not character.Parent or not humanoid.Parent or not rootPart.Parent or humanoid.Health <= 0 then
+        fireflyDiag.log("ARM_SENSOR_FAILED", "character unavailable before arming")
+        return false
+    end
 
     shoulder = shoulder or findFireflyRightShoulder(character)
     if not shoulder
         or not (shoulder:IsA("Motor6D") or shoulder.ClassName == "AnimationConstraint") then
         statusLabel.Text = "Firefly: right arm sensor unavailable"
-        return
+        fireflyDiag.log("ARM_SENSOR_FAILED", statusLabel.Text)
+        return false
     end
 
     local armPart = getFireflyArmPart(shoulder, character)
     if not armPart then
         statusLabel.Text = "Firefly: right arm part unavailable"
-        return
+        fireflyDiag.log("ARM_SENSOR_FAILED", statusLabel.Text)
+        return false
     end
 
     local neutralLateral = getFireflyArmLateralPosition(shoulder, armPart)
     if neutralLateral == nil then
         statusLabel.Text = "Firefly: right arm position unavailable"
-        return
+        fireflyDiag.log("ARM_SENSOR_FAILED", statusLabel.Text)
+        return false
     end
 
     local armLength = math.max(armPart.Size.Magnitude, 0.1)
@@ -3174,11 +3713,15 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
     local nextFirstJumpRetryAt = 0
     local secondJumpRequestDeadline = nil
     local nextSecondJumpRetryAt = 0
+    local nextArmTraceAt = 0
 
     statusLabel.Text = "Firefly: tracking right arm"
+    fireflyDiag.log("ARM_SENSOR", string.format("rig=%s; shoulder=%s; sensor=%s; neutral=%.4f; initialThreshold=%.4f; returnThreshold=%.4f; hipHeight=%.3f; rootHeight=%.3f",
+        tostring(humanoid.RigType),tostring(shoulder.ClassName),armPart.Name,neutralLateral,
+        initialTravelThreshold,returnTravelThreshold,humanoid.HipHeight,getFireflyRootHeight(character,humanoid,rootPart)))
 
     local function lockMovement()
-        fireflyDiag.log("PLAYER_LOCK_BEGIN", "existing lockMovement() entered; jump sink + idle Move(0), no PlayerModule disable")
+        fireflyDiag.log("PLAYER_LOCK_BEGIN", "temporary movement/jump action sink + world-space steering; PlayerModule remains enabled")
         pcall(function()
             if not humanoid:GetAttribute("__FireflyMovementLockActive") then
                 humanoid:SetAttribute("__FireflyMovementLockWalkSpeed", humanoid.WalkSpeed)
@@ -3195,7 +3738,14 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
                 false,
                 10000,
                 Enum.PlayerActions.CharacterJump,
-                Enum.KeyCode.Space
+                Enum.PlayerActions.CharacterForward,
+                Enum.PlayerActions.CharacterBackward,
+                Enum.PlayerActions.CharacterLeft,
+                Enum.PlayerActions.CharacterRight,
+                Enum.KeyCode.Space,
+                Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+                Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right,
+                Enum.KeyCode.Thumbstick1
             )
         end)
         RunService:BindToRenderStep(
@@ -3276,7 +3826,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         rayParams.FilterDescendantsInstances = {character}
         rayParams.IgnoreWater = true
 
-        local rayLength = math.max(humanoid.HipHeight + rootPart.Size.Y * 0.5 + 1.5, 4)
+        local rayLength = math.max(getFireflyRootHeight(character, humanoid, rootPart) + 1.5, 4)
         local lid = fireflyDoubleJumpLid
         local result = Workspace:Raycast(rootPart.Position, Vector3.new(0, -rayLength, 0), rayParams)
         local centerHitInstance = result and result.Instance or nil
@@ -3297,6 +3847,16 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         end
 
         if lid and lid.Parent == Workspace then
+            local leftFoot = character:FindFirstChild("LeftFoot") or character:FindFirstChild("Left Leg")
+            local rightFoot = character:FindFirstChild("RightFoot") or character:FindFirstChild("Right Leg")
+            for _, foot in pairs({leftFoot, rightFoot}) do
+                if foot:IsA("BasePart") then
+                    local footOrigin = Vector3.new(foot.Position.X,
+                        math.max(rootPart.Position.Y, foot.Position.Y + 0.5), foot.Position.Z)
+                    local hit = Workspace:Raycast(footOrigin, Vector3.new(0, -rayLength, 0), rayParams)
+                    if isLidTopHit(hit) then return lid end
+                end
+            end
             -- The character can physically touch the top with its feet while the root-center
             -- ray falls just outside the lid's edge. Probe a small cross around the root, but
             -- still require a real ray hit on the lid's top face to avoid treating side contact
@@ -3396,7 +3956,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         secondJumpRequested = true
         fireflyDiag.log("LID_JUMP_REQUEST", "recognized lid landing; requesting second jump now")
         secondJumpRequestStartedAt = os.clock()
-        secondJumpRequestDeadline = secondJumpRequestStartedAt + 0.35
+        secondJumpRequestDeadline = secondJumpRequestStartedAt + Config.FIREFLY_SECOND_JUMP_CONFIRM_TIME
         nextSecondJumpRetryAt = secondJumpRequestStartedAt + 0.06
         local lid = fireflyDoubleJumpLid
         local lidVerticalVelocity = lid and lid.Parent == Workspace and lid.AssemblyLinearVelocity.Y or 0
@@ -3510,6 +4070,9 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         nextFirstJumpRetryAt = sequenceStartedAt + 0.04
         sequenceResolutionDeadline = sequenceStartedAt + 2.0
         statusLabel.Text = wasAirborneAtTrigger and "Firefly: waiting for fresh jump" or "Firefly: first jump"
+        fireflyDiag.log("SEQUENCE_BEGIN", string.format("airborneAtTrigger=%s; state=%s; rootVy=%.2f; lateral=%.4f; firstTravel=%.4f; returnTravel=%.4f",
+            tostring(wasAirborneAtTrigger),tostring(humanoid:GetState()),rootPart.AssemblyLinearVelocity.Y,
+            previousLateral,firstLegTravel,returnTravel))
 
         inputWindowDeadline = sequenceStartedAt + Config.FIREFLY_FIRST_JUMP_HOLD_TIME
         local movementStartAt = sequenceStartedAt + 0.05
@@ -3544,6 +4107,22 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         return true
     end
 
+    local function confirmFirstTakeoff()
+        if not sequenceStarted or firstJumpAirborne or not firstJumpRequestDeadline
+            or not character.Parent or not rootPart.Parent or not humanoid.Parent or humanoid.Health <= 0 then return false end
+        local state = humanoid:GetState()
+        local vy = rootPart.AssemblyLinearVelocity.Y
+        if humanoid.FloorMaterial == Enum.Material.Air
+            and (state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall)
+            and vy >= getFireflyJumpConfirmationSpeed(humanoid) then
+            firstJumpAirborne = true
+            firstJumpRequestDeadline = nil
+            fireflyDiag.log("FIRST_TAKEOFF_CONFIRMED", string.format("state=%s; vy=%.2f",tostring(state),vy))
+            return true
+        end
+        return false
+    end
+
     fireflyDoubleJumpJumpingConnection = humanoid.Jumping:Connect(function(active)
         fireflyDiag.log("JUMPING_EVENT", "active=" .. tostring(active)
             .. "; seq=" .. tostring(sequenceStarted)
@@ -3559,7 +4138,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             and humanoid.Health > 0
             and isSecondJumpBeginning() then
             local verticalVelocity = rootPart.AssemblyLinearVelocity.Y
-            if verticalVelocity >= 20.0 then
+            if verticalVelocity >= getFireflyJumpConfirmationSpeed(humanoid) then
                 releaseAfterSecondJump("jump event with upward impulse")
             else
                 -- The Jumping signal can fire before physics applies the actual jump
@@ -3597,7 +4176,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         if newState == Enum.HumanoidStateType.Jumping then
             if isSecondJumpBeginning() then
                 local verticalVelocity = rootPart.AssemblyLinearVelocity.Y
-                if verticalVelocity >= 20.0 then
+                if verticalVelocity >= getFireflyJumpConfirmationSpeed(humanoid) then
                     releaseAfterSecondJump("state event with upward impulse")
                 else
                     -- StateChanged can precede the physical jump impulse as well.
@@ -3610,8 +4189,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
                 return
             end
 
-            firstJumpAirborne = true
-            firstJumpRequestDeadline = nil
+            confirmFirstTakeoff()
             return
         end
 
@@ -3629,6 +4207,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
 
     local lastSecondJumpPhysicsDiagAt = 0
     fireflyDoubleJumpPhysicsConnection = RunService.PostSimulation:Connect(function()
+        confirmFirstTakeoff()
         if not sequenceStarted
             or not firstJumpAirborne
             or secondJumpDetected
@@ -3637,6 +4216,15 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             or not humanoid.Parent
             or humanoid.Health <= 0 then
             return
+        end
+
+        -- A brief physical landing can occur between rendered frames without a
+        -- matching StateChanged callback. Require the same grounded/top-face check.
+        if not landedOnLid and fireflyDoubleJumpLid ~= nil
+            and isCharacterGrounded() and getGroundPart() == fireflyDoubleJumpLid then
+            fireflyDiag.log("LID_PHYSICS_CONTACT", "grounded top-face contact observed after simulation")
+            firstLandingSeen = true
+            registerLandedOnLid()
         end
 
         -- Remember that the first airborne phase has genuinely entered descent.
@@ -3659,7 +4247,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         end
 
         if firstJumpDescentObserved
-            and verticalVelocity >= 20.0
+            and verticalVelocity >= getFireflyJumpConfirmationSpeed(humanoid)
             and (currentState == Enum.HumanoidStateType.Jumping
                 or currentState == Enum.HumanoidStateType.Freefall) then
             local recentClimbingContact = lastClimbingStateAt ~= nil
@@ -3697,7 +4285,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         if firstLandingSeen and (not landedOnLid or not secondJumpRequested) then
             local currentState = humanoid:GetState()
             local verticalVelocity = rootPart.AssemblyLinearVelocity.Y
-            if verticalVelocity >= 2.0
+            if verticalVelocity >= getFireflyJumpConfirmationSpeed(humanoid)
                 and (currentState == Enum.HumanoidStateType.Jumping
                     or currentState == Enum.HumanoidStateType.Freefall) then
                 fireflyDiag.log("POST_LANDING_TAKEOFF", "fallback detected upward velocity; vy="
@@ -3749,7 +4337,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         -- The lid can move independently and create a large relative-velocity change
         -- while the character is still grounded. Never treat lid-relative motion alone
         -- as proof that the player's second jump has begun.
-        if playerVerticalVelocity >= 2.0
+        if playerVerticalVelocity >= getFireflyJumpConfirmationSpeed(humanoid)
             and (playerState == Enum.HumanoidStateType.Jumping
                 or playerState == Enum.HumanoidStateType.Freefall)
             and relativeVerticalVelocity >= 2.0
@@ -3759,7 +4347,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
     end)
 
     local function handleFireflyLidAppearance(lid)
-        if not lid or not lid:IsA("Part") or lid.Parent ~= Workspace then
+        if not lid or not lid:IsA("BasePart") or lid.Parent ~= Workspace then
             return
         end
         if preExistingLids and preExistingLids[lid] then
@@ -3768,11 +4356,26 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         if fireflyDoubleJumpLid and fireflyDoubleJumpLid.Parent and fireflyDoubleJumpLid ~= lid then
             return
         end
+        local creator = lid:FindFirstChild("creator")
+        if creator and creator:IsA("ObjectValue") and creator.Value
+            and creator.Value:IsA("Player") and creator.Value ~= LocalPlayer then
+            fireflyDiag.log("LID_REJECTED", "another player owns "..lid:GetFullName())
+            return
+        end
+        local distance = (lid.Position - rootPart.Position).Magnitude
+        if distance > math.max(12, armLength * 4) then
+            fireflyDiag.log("LID_REJECTED", string.format("outside jar vicinity; distance=%.2f; path=%s",distance,lid:GetFullName()))
+            return
+        end
         bindFireflyLid(lid)
+        local p, v = lid.Position, lid.AssemblyLinearVelocity
+        fireflyDiag.log("LID_BOUND", string.format("path=%s; distance=%.2f; pos=(%.2f,%.2f,%.2f); velocity=(%.2f,%.2f,%.2f); collide=%s; anchored=%s; creator=%s; size=(%.2f,%.2f,%.2f); up=(%.2f,%.2f,%.2f)",
+            lid:GetFullName(),distance,p.X,p.Y,p.Z,v.X,v.Y,v.Z,tostring(lid.CanCollide),tostring(lid.Anchored),tostring(creator and creator.Value),
+            lid.Size.X,lid.Size.Y,lid.Size.Z,lid.CFrame.UpVector.X,lid.CFrame.UpVector.Y,lid.CFrame.UpVector.Z))
     end
 
     fireflyDoubleJumpLidConnection = Workspace.ChildAdded:Connect(function(instance)
-        if instance and instance.Name == "Handle2" and instance:IsA("Part")
+        if instance and instance.Name == "Handle2" and instance:IsA("BasePart")
             and instance.Parent == Workspace
             and not (preExistingLids and preExistingLids[instance]) then
             handleFireflyLidAppearance(instance)
@@ -3780,7 +4383,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
     end)
 
     for _, existingLid in ipairs(Workspace:GetChildren()) do
-        if existingLid.Name == "Handle2" and existingLid:IsA("Part")
+        if existingLid.Name == "Handle2" and existingLid:IsA("BasePart")
             and not (preExistingLids and preExistingLids[existingLid]) then
             handleFireflyLidAppearance(existingLid)
         end
@@ -3800,6 +4403,12 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             end
 
             local lateral = getFireflyArmLateralPosition(shoulder, armPart)
+            if now >= nextArmTraceAt then
+                nextArmTraceAt = now + 0.10
+                fireflyDiag.log("ARM_TRACE", string.format("active=%s; phase=%d; lateral=%s; neutral=%.4f; initialTravel=%.4f; returnTravel=%.4f; rootVy=%.2f; state=%s",
+                    tostring(not activationState or activationState.activated),phase,tostring(lateral),neutralLateral,
+                    firstLegTravel,returnTravel,rootPart.AssemblyLinearVelocity.Y,tostring(humanoid:GetState())))
+            end
             if activationState and not activationState.activated then
                 if lateral ~= nil then
                     neutralLateral = lateral
@@ -3870,6 +4479,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             end
         end
 
+        confirmFirstTakeoff()
         if not firstJumpAirborne then
             if firstJumpRequestDeadline and now >= firstJumpRequestDeadline then
                 finishAttempt("Firefly: first jump not detected")
@@ -3943,6 +4553,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             end
         end
     end)
+    return true
 end
 
 local function armFireflyBounce(character, humanoid, rootPart)
@@ -4009,203 +4620,75 @@ local function armFireflyBounce(character, humanoid, rootPart)
     end)
 end
 
-local function armBombBounce(character, humanoid, rootPart, bombPart, targetPosition, bombTool)
+local function armBombBounce(character, humanoid, rootPart, bombPart, targetPosition, bombTool, getObservedBomb)
     if not character or not humanoid or not rootPart then
         return
     end
 
     if savedBombSettings.BombStyle == "Blatant" and selectedBombType ~= "Firefly Jar" then
         local deadline = os.clock() + Config.BOMB_BOUNCE_TRACK_TIME
-        local trackedBomb = bombPart
-        local foundBomb = trackedBomb ~= nil and trackedBomb.Parent ~= nil
         local finished = false
-        local previousGap = nil
-        local contactConnection = nil
-        local descendantConnection = nil
-        local fallbackBombHeight = 1
+        local jumpConnection
 
-        local function cleanupContactTracking()
-            if contactConnection then
-                contactConnection:Disconnect()
-                contactConnection = nil
-            end
-            if descendantConnection then
-                descendantConnection:Disconnect()
-                descendantConnection = nil
-            end
-        end
-
-        local function getTrackedBombBounds(part)
-            if not part or not part.Parent then
-                return nil, nil
-            end
-            local container = getBombContainer(part, character)
-            if container and container:IsA("Model") then
-                local ok, boundsCFrame, boundsSize = pcall(function()
-                    return container:GetBoundingBox()
-                end)
-                if ok and boundsCFrame and boundsSize then
-                    return boundsCFrame, boundsSize
-                end
-            end
-            return part.CFrame, part.Size
-        end
-
-        local function horizontalDistance(first, second)
-            return Vector3.new(first.X - second.X, 0, first.Z - second.Z).Magnitude
-        end
-
-        local function getContactPlaneY()
-            if targetPosition then
-                local expectedBombHeight = fallbackBombHeight
-                if trackedBomb and trackedBomb.Parent then
-                    local container = getBombContainer(trackedBomb, character)
-                    expectedBombHeight = getBombHeight(trackedBomb, container)
-                end
-                return targetPosition.Y + expectedBombHeight - Config.BOMB_GROUND_SINK
-            end
-
-            if trackedBomb and trackedBomb.Parent then
-                local boundsCFrame, boundsSize = getTrackedBombBounds(trackedBomb)
-                if boundsCFrame and boundsSize then
-                    return boundsCFrame.Position.Y + boundsSize.Y * 0.5
-                end
-            end
-
-            return nil
-        end
-
-        local function triggerBlatantJump()
-            if finished or not character.Parent or not rootPart.Parent or humanoid.Health <= 0 then
-                return
-            end
+        local function finish()
             finished = true
-            cleanupContactTracking()
+            if jumpConnection then
+                jumpConnection:Disconnect()
+                jumpConnection = nil
+            end
+        end
+
+        local function tryAirJump()
+            if finished then return true end
+            if fireflyDiag.stopped or character ~= LocalPlayer.Character
+                or not character.Parent or not rootPart.Parent or not humanoid.Parent or humanoid.Health <= 0 then
+                finish()
+                return true
+            end
 
             local velocity = rootPart.AssemblyLinearVelocity
-            local jumpVelocity
-            if humanoid.UseJumpPower then
-                jumpVelocity = humanoid.JumpPower
-            else
-                jumpVelocity = math.sqrt(math.max(0, 2 * Workspace.Gravity * humanoid.JumpHeight))
+            if velocity.Y > -Config.BOMB_LAUNCH_FALL_SPEED then
+                return false
             end
+
+            local jumpVelocity = humanoid.UseJumpPower and humanoid.JumpPower
+                or math.sqrt(math.max(0, 2 * Workspace.Gravity * humanoid.JumpHeight))
+            finish()
             pcall(function()
                 humanoid.Jump = false
                 humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
             end)
-            rootPart.AssemblyLinearVelocity = Vector3.new(
-                velocity.X,
-                math.max(velocity.Y, jumpVelocity),
-                velocity.Z
-            )
-            statusLabel.Text = "Blatant: air jump synchronized"
+            rootPart.AssemblyLinearVelocity = Vector3.new(velocity.X, math.max(velocity.Y, jumpVelocity), velocity.Z)
+            statusLabel.Text = "Blatant: air jump"
+            fireflyDiag.log("BLATANT_JUMP", string.format("impulse=%.2f; previousY=%.2f; independent of bomb contact",jumpVelocity,velocity.Y))
+            return true
         end
 
-        local initialHumanoidState = humanoid:GetState()
-        local initialVerticalVelocity = rootPart.AssemblyLinearVelocity.Y
-        local alreadyInFreefall = initialHumanoidState == Enum.HumanoidStateType.Freefall
-            or initialHumanoidState == Enum.HumanoidStateType.FallingDown
-
-        if not alreadyInFreefall
-            and humanoid.FloorMaterial == Enum.Material.Air
-            and initialVerticalVelocity < -0.5 then
-            alreadyInFreefall = true
-        end
-
-        if alreadyInFreefall then
-            triggerBlatantJump()
-            return
-        end
-
-        local function considerBombCandidate(instance)
-            if trackedBomb and trackedBomb.Parent then
-                return
-            end
-            if not isBombCandidate(instance, character, bombTool) then
-                return
-            end
-            if targetPosition and horizontalDistance(instance.Position, targetPosition) > Config.BOMB_BOUNCE_CHECK_RADIUS + 2 then
-                return
-            end
-            trackedBomb = instance
-            foundBomb = true
-        end
-
-        if not trackedBomb or not trackedBomb.Parent then
-            trackedBomb = findNearbyBombPart(character, bombTool, targetPosition)
-            foundBomb = trackedBomb ~= nil
-        end
-        descendantConnection = Workspace.DescendantAdded:Connect(considerBombCandidate)
-
-        contactConnection = RunService.PostSimulation:Connect(function(deltaTimeSim)
-            if finished then
-                cleanupContactTracking()
-                return
-            end
-            if not character.Parent or not rootPart.Parent or humanoid.Health <= 0 then
-                finished = true
-                cleanupContactTracking()
-                return
-            end
+        if tryAirJump() then return end
+        jumpConnection = RunService.PostSimulation:Connect(function()
             if os.clock() >= deadline then
-                finished = true
-                cleanupContactTracking()
-                statusLabel.Text = foundBomb and "Blatant: air-jump timing missed" or "Blatant: virtual-plane timing missed"
+                finish()
+                fireflyDiag.log("BLATANT_JUMP_END", "descent threshold not reached before timeout")
                 return
             end
-
-            if not trackedBomb or not trackedBomb.Parent then
-                trackedBomb = findNearbyBombPart(character, bombTool, targetPosition)
-                if trackedBomb then
-                    foundBomb = true
-                end
-            end
-
-            local contactPlaneY = getContactPlaneY()
-            if not contactPlaneY then
-                return
-            end
-
-            local _, footBottomY = getFootData(character, rootPart)
-            local velocityY = rootPart.AssemblyLinearVelocity.Y
-            local verticalGap = footBottomY - contactPlaneY
-            local timeToContact = nil
-
-            if velocityY < -0.5 then
-                timeToContact = solveDescendingGroundHitTime(
-                    footBottomY,
-                    velocityY,
-                    contactPlaneY,
-                    Workspace.Gravity
-                )
-            end
-
-            local contactWithinFrame = timeToContact ~= nil
-                and timeToContact >= 0
-                and timeToContact <= math.clamp(deltaTimeSim * 1.5, 0.020, 0.035)
-            local crossedContactPlane = previousGap ~= nil
-                and previousGap > 0
-                and verticalGap <= 0
-            local insideContactBand = verticalGap <= 0.30 and verticalGap >= -0.85
-            local alreadyPastPlaneOnFirstSample = previousGap == nil and verticalGap < -0.85
-
-            if velocityY < -0.5 and (
-                contactWithinFrame
-                or crossedContactPlane
-                or insideContactBand
-                or alreadyPastPlaneOnFirstSample
-            ) then
-                triggerBlatantJump()
-                return
-            end
-
-            previousGap = verticalGap
+            tryAirJump()
         end)
         return
     end
 
-    local deadline = os.clock() + Config.BOMB_BOUNCE_INPUT_HOLD_TIME
+    local hardDeadline = os.clock() + Config.BOMB_BOUNCE_TRACK_TIME
+    local observedBomb = bombPart ~= nil and bombPart.Parent ~= nil
+    local deadline = observedBomb and (os.clock() + Config.BOMB_BOUNCE_INPUT_HOLD_TIME) or hardDeadline
     local inputConnection
+    local contactNudgeLogged = false
+    local expectedJumpSpeed
+    if humanoid.UseJumpPower then
+        expectedJumpSpeed = humanoid.JumpPower
+    else
+        expectedJumpSpeed = math.sqrt(math.max(0, 2 * Workspace.Gravity * humanoid.JumpHeight))
+    end
+    local jumpConfirmationSpeed = math.max(0.5, expectedJumpSpeed * 0.5)
+    fireflyDiag.log("NORMAL_JUMP_WINDOW", observedBomb and "bomb candidate already observed" or "holding input while awaiting replicated bomb; bounded to track timeout")
 
     local function cleanup()
         if inputConnection then
@@ -4218,9 +4701,31 @@ local function armBombBounce(character, humanoid, rootPart, bombPart, targetPosi
     end
 
     inputConnection = RunService.RenderStepped:Connect(function()
+        if not observedBomb and getObservedBomb then
+            local candidate = getObservedBomb()
+            if candidate and candidate.Parent then
+                observedBomb = true
+                deadline = math.min(hardDeadline, os.clock() + Config.BOMB_BOUNCE_INPUT_HOLD_TIME)
+                fireflyDiag.log("NORMAL_BOMB_ARRIVED", "jump input window extended from actual client observation")
+            end
+        end
         if not character.Parent or not rootPart.Parent or humanoid.Health <= 0 or os.clock() >= deadline then
+            fireflyDiag.log("NORMAL_JUMP_END", "input window closed; observed="..tostring(observedBomb))
             cleanup()
             return
+        end
+        local verticalSpeed = rootPart.AssemblyLinearVelocity.Y
+        local currentState = humanoid:GetState()
+        if currentState == Enum.HumanoidStateType.Jumping and verticalSpeed >= jumpConfirmationSpeed then
+            fireflyDiag.log("NORMAL_JUMP_CONFIRMED", string.format("state=Jumping; vY=%.2f; expected=%.2f",
+                verticalSpeed,expectedJumpSpeed))
+            cleanup()
+            return
+        end
+        if verticalSpeed > 1 and not contactNudgeLogged then
+            contactNudgeLogged = true
+            fireflyDiag.log("NORMAL_CONTACT_NUDGE", string.format("vY=%.2f; state=%s; input retained; confirmation threshold=%.2f",
+                verticalSpeed,tostring(currentState),jumpConfirmationSpeed))
         end
 
         pcall(function()
@@ -4399,10 +4904,17 @@ local function activateFireflyJar()
     if not humanoid or not rootPart or humanoid.Health <= 0 then
         return false
     end
+    fireflyDiag.beginAttempt()
+    fireflyDiag.log("ACTIVATION_BEGIN", string.format("state=%s; rig=%s; rootVy=%.2f; speed=%.2f; ping=%.0fms; root=(%.2f,%.2f,%.2f); velocity=(%.2f,%.2f,%.2f); input=(%.2f,%.2f); facing=(%.2f,%.2f)",
+        tostring(humanoid:GetState()),tostring(humanoid.RigType),rootPart.AssemblyLinearVelocity.Y,
+        humanoid.WalkSpeed,getBombPing(player)*1000,rootPart.Position.X,rootPart.Position.Y,rootPart.Position.Z,
+        rootPart.AssemblyLinearVelocity.X,rootPart.AssemblyLinearVelocity.Y,rootPart.AssemblyLinearVelocity.Z,
+        humanoid.MoveDirection.X,humanoid.MoveDirection.Z,rootPart.CFrame.LookVector.X,rootPart.CFrame.LookVector.Z))
 
     local bombTool = prepareRealFireflyJar(player)
     if not bombTool then
         statusLabel.Text = "Firefly Jar not found"
+        fireflyDiag.log("ACTIVATION_FAILED", statusLabel.Text)
         return false
     end
 
@@ -4424,6 +4936,7 @@ local function activateFireflyJar()
                 fireflyEquippedConnection:Disconnect()
             end
             statusLabel.Text = "Firefly Jar is not in Backpack"
+            fireflyDiag.log("ACTIVATION_FAILED", statusLabel.Text)
             return false
         end
 
@@ -4473,12 +4986,18 @@ local function activateFireflyJar()
 
     if bombTool.Parent ~= character or not fireflyEquipped then
         statusLabel.Text = "Firefly Jar could not be equipped"
+        fireflyDiag.log("ACTIVATION_FAILED", statusLabel.Text)
         return false
     end
 
     lastKnownBombTool = bombTool
 
     task.wait(Config.FIREFLY_EQUIP_SETTLE_TIME)
+    if activationGeneration ~= bombCooldownGeneration or player.Character ~= character
+        or not character.Parent or humanoid.Health <= 0 then
+        fireflyDiag.log("ACTIVATION_CANCELLED", "character or cooldown generation changed during equip")
+        return false
+    end
 
     local originalManualActivationOnly = nil
     pcall(function()
@@ -4496,7 +5015,7 @@ local function activateFireflyJar()
     local preActivationFireflyLids = snapshotExistingFireflyLids()
     local fireflyShoulder = findFireflyRightShoulder(character)
     local fireflyActivationState = { activated = false }
-    armFireflyDoubleJump(
+    local armed = armFireflyDoubleJump(
         character,
         humanoid,
         rootPart,
@@ -4504,6 +5023,14 @@ local function activateFireflyJar()
         preActivationFireflyLids,
         fireflyActivationState
     )
+    if not armed then
+        pcall(function()
+            if originalManualActivationOnly ~= nil then bombTool.ManualActivationOnly = originalManualActivationOnly end
+        end)
+        unlockBombActivation()
+        fireflyDiag.log("ACTIVATION_FAILED", "arm sensor preflight failed; no activation input sent")
+        return false
+    end
 
     local activated = false
     local fireflyReleaseAnchor = nil
@@ -4515,6 +5042,8 @@ local function activateFireflyJar()
         toolActivationConnection = bombTool.Activated:Connect(function()
             toolActivationObserved = true
             fireflyActivationState.activated = true
+            fireflyDiag.log("TOOL_ACTIVATED", string.format("elapsed=%.3f; state=%s; rootVy=%.2f",
+                os.clock()-cooldownAnchor,tostring(humanoid:GetState()),rootPart.AssemblyLinearVelocity.Y))
         end)
     end)
 
@@ -4539,6 +5068,7 @@ local function activateFireflyJar()
     end
 
     if fireflyMouse and fireflyMouse.Button1Down and type(firesignal) == "function" then
+        fireflyDiag.log("ACTIVATION_PATH", "mouse firesignal")
         local pressSucceeded = pcall(function()
             fireflyReleaseAnchor = os.clock()
             fireflyMousePressStarted = true
@@ -4553,6 +5083,7 @@ local function activateFireflyJar()
     end
 
     if not activated and fireflyMouse and fireflyMouse.Button1Down and type(getconnections) == "function" then
+        fireflyDiag.log("ACTIVATION_PATH", "mouse callback fallback")
         local callSucceeded, invoked = pcall(function()
             fireflyReleaseAnchor = os.clock()
             local connections = getconnections(fireflyMouse.Button1Down)
@@ -4570,6 +5101,7 @@ local function activateFireflyJar()
     end
 
     if not activated then
+        fireflyDiag.log("ACTIVATION_PATH", "Tool:Activate fallback")
         local activateSucceeded = pcall(function()
             fireflyReleaseAnchor = os.clock()
             bombTool:Activate()
@@ -4583,6 +5115,7 @@ local function activateFireflyJar()
         toolActivationConnection:Disconnect()
         toolActivationConnection = nil
     end
+    fireflyDiag.log("ACTIVATION_RESULT", "Tool.Activated observed="..tostring(activated))
 
     if not activated then
         releaseFireflyMousePress()
@@ -4691,14 +5224,16 @@ local function launchPendingBombJump()
         return
     end
 
+    if not BombStyleRuntime.isDescending(humanoid, rootPart) then
+        return
+    end
+
     if bombTool.Parent ~= character then
         return
     end
 
     if freefallFastPath then
         pendingBombLaunchInProgress = true
-        task.wait(BombStyleRuntime.FreefallReleaseDelay)
-
         if not pendingBombJump
             or pendingBombSequenceGeneration ~= launchGeneration
             or pendingBombCharacter ~= character
@@ -4735,6 +5270,7 @@ local function launchPendingBombJump()
     local targetPosition = nil
     local targetPart = nil
     local bombPart = nil
+    local bombTrace = nil
     local descendantConnection
     local detectionDeadline = os.clock() + 0.18
     local launchConfirmed = false
@@ -4847,6 +5383,7 @@ local function launchPendingBombJump()
         end
 
         bombPart = candidate
+        BombStyleRuntime.traceBomb(bombTrace, candidate, character, rootPart)
         return true
     end
 
@@ -4918,6 +5455,7 @@ local function launchPendingBombJump()
 
     if directRemoteLaunch then
         targetPosition = remoteTargetPosition
+        bombTrace = BombStyleRuntime.latestTrace
     else
         targetPosition, _, targetPart = getPredictedBombTarget(
             character,
@@ -5071,7 +5609,6 @@ local function launchPendingBombJump()
         end)
     end)
 
-    cleanupDetection()
     if activationConnection then
         activationConnection:Disconnect()
     end
@@ -5083,12 +5620,21 @@ local function launchPendingBombJump()
         end
     end
 
-    armBombBounce(character, humanoid, rootPart, bombPart, targetPosition, bombTool)
+    BombStyleRuntime.traceBomb(bombTrace, bombPart, character, rootPart)
+    armBombBounce(character, humanoid, rootPart, bombPart, targetPosition, bombTool, function()
+        return bombPart
+    end)
 
     task.spawn(function()
         local placementDeadline = os.clock() + Config.BOMB_BOUNCE_TRACK_TIME
 
         while os.clock() < placementDeadline do
+            if fireflyDiag.stopped or character ~= player.Character or not character.Parent or humanoid.Health <= 0 then
+                break
+            end
+            if not bombPart then
+                selectNewlySpawnedBombPart()
+            end
             if not bombPart then
                 bombPart = findNearbyBombPart(character, bombTool, targetPosition)
                 if not bombPart then
@@ -5097,6 +5643,7 @@ local function launchPendingBombJump()
             end
 
             if bombPart and bombPart.Parent then
+                BombStyleRuntime.traceBomb(bombTrace, bombPart, character, rootPart)
                 if not directRemoteLaunch then
                     placeBombAtTarget(bombPart, character, targetPosition)
                 end
@@ -5105,7 +5652,10 @@ local function launchPendingBombJump()
 
             RunService.Heartbeat:Wait()
         end
-
+        cleanupDetection()
+        if bombTrace and not bombTrace.observed and not fireflyDiag.stopped then
+            fireflyDiag.log("NO_BOMB_OBSERVED", "no candidate found during tracking; not proof of a rejected throw or an underground bomb")
+        end
     end)
 
     if mouse then
@@ -5213,31 +5763,8 @@ isBombJumpGrounded = function(character, humanoid, rootPart)
 end
 
 
-local function getBombLaunchFallSpeed()
-    return Config.BOMB_LAUNCH_FALL_SPEED
-end
-
 local function isBombLaunchMoment(humanoid, rootPart)
-    if not humanoid or not rootPart or humanoid.Health <= 0 then
-        return false
-    end
-
-    local state = humanoid:GetState()
-    if state ~= Enum.HumanoidStateType.Freefall and state ~= Enum.HumanoidStateType.FallingDown then
-        return false
-    end
-
-    local launchFallSpeed = getBombLaunchFallSpeed()
-    local oneWayLatency, effectivePing = getBombOneWayLatency(LocalPlayer)
-
-    if effectivePing > Config.BOMB_HIGH_PING_THRESHOLD then
-        launchFallSpeed = math.max(
-            0,
-            launchFallSpeed - workspace.Gravity * oneWayLatency
-        )
-    end
-
-    return rootPart.AssemblyLinearVelocity.Y <= -launchFallSpeed
+    return BombStyleRuntime.isDescending(humanoid, rootPart)
 end
 
 local function beginPendingBombJump(isToggleMode, bombTool, character, humanoid, rootPart, wasEquipped, originalManualActivationOnly, showArmed, startedInFreefall)
@@ -5258,6 +5785,7 @@ local function beginPendingBombJump(isToggleMode, bombTool, character, humanoid,
     pendingBombStartedInFreefall = startedInFreefall == true
         and BombStyleRuntime.usesInstantFreefallLaunch()
     pendingBombLaunchWindowReached = pendingBombStartedInFreefall
+        or isBombLaunchMoment(humanoid, rootPart)
     pendingBombJump = true
 
     pcall(function()
@@ -5269,11 +5797,13 @@ local function beginPendingBombJump(isToggleMode, bombTool, character, humanoid,
             return
         end
 
-        if (newState == Enum.HumanoidStateType.Freefall or newState == Enum.HumanoidStateType.FallingDown) and isBombLaunchMoment(humanoid, rootPart) then
+        if (newState == Enum.HumanoidStateType.Freefall or newState == Enum.HumanoidStateType.FallingDown)
+            and isBombLaunchMoment(humanoid, rootPart) then
             pendingBombLaunchWindowReached = true
             task.defer(function()
                 local canLaunch = selectedBombType == "Firefly Jar" or bombTool:FindFirstChild("Remote")
                 if pendingBombJump and bombTool.Parent == character and canLaunch
+                    and isBombLaunchMoment(humanoid, rootPart)
                     and (not pendingBombStartedInFreefall or pendingBombEquipDeadline <= 0) then
                     launchPendingBombJump()
                 end
@@ -5401,14 +5931,8 @@ local function quickUseBomb(isToggleMode, armOnly)
         return
     end
 
-    local requestState = humanoid:GetState()
-    local requestVerticalVelocity = rootPart.AssemblyLinearVelocity.Y
     local requestedDuringFreefall = BombStyleRuntime.usesInstantFreefallLaunch()
-        and (
-            requestState == Enum.HumanoidStateType.Freefall
-            or requestState == Enum.HumanoidStateType.FallingDown
-        )
-        and requestVerticalVelocity <= 0.5
+        and BombStyleRuntime.isDescending(humanoid, rootPart)
 
     if armOnly and not isBombJumpGrounded(character, humanoid, rootPart) then
         return
@@ -5557,7 +6081,6 @@ local function quickUseBomb(isToggleMode, armOnly)
     end
 
     if pendingBombJump
-        and pendingBombStartedInFreefall
         and pendingBombLaunchWindowReached
         and bombTool.Parent == character then
         local currentState = humanoid:GetState()
@@ -5689,9 +6212,15 @@ bombButton.Activated:Connect(function()
     if selectedBombType == "Firefly Jar" then
         bombActionInProgress = true
         task.defer(function()
-            pcall(function()
+            local ok, err = pcall(function()
                 activateFireflyJar()
             end)
+            if not ok then
+                fireflyDiag.log("ACTIVATION_ERROR", tostring(err))
+                cancelFireflyDoubleJump()
+                unlockBombActivation()
+                statusLabel.Text = "Firefly: activation error; copy Jar diagnostics"
+            end
             bombActionInProgress = false
             bombPressReleased = true
             bombPressInput = nil
@@ -5773,7 +6302,10 @@ local function setupCharacter(character)
             return
         end
 
-        if state == Enum.HumanoidStateType.Jumping then
+        local freefallLaunch = BombStyleRuntime.usesInstantFreefallLaunch()
+            and (state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.FallingDown)
+            and BombStyleRuntime.isDescending(humanoid, character:FindFirstChild("HumanoidRootPart"))
+        if state == Enum.HumanoidStateType.Jumping or freefallLaunch then
             if not bombActionInProgress and not pendingBombJump then
                 hasTriggeredBomb = true
                 bombActionInProgress = true
@@ -5814,7 +6346,7 @@ local function setupCharacter(character)
         end
 
         local rootPart = character:FindFirstChild("HumanoidRootPart")
-        if not rootPart or rootPart.AssemblyLinearVelocity.Y > -0.5 then
+        if not rootPart or not BombStyleRuntime.isDescending(humanoid, rootPart) then
             return
         end
 
@@ -5838,4 +6370,7 @@ LocalPlayer.CharacterAdded:Connect(function(character)
 end)
 
 statusLabel.Text = resolveToyEvent() and "Ready" or "Ready: ReplicateToy unavailable"
+if fireflyDiag.initError or fireflyDiag.guiError then
+    statusLabel.Text = "Controller ready; Jar diagnostics error: " .. tostring(fireflyDiag.initError or fireflyDiag.guiError)
+end
 updateBombVisuals()
