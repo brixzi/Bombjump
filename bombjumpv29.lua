@@ -35,6 +35,15 @@ end
 local fireflyDiag = {}
 do
     local state = fireflyDiag
+    state.runtimeConnections = {}
+    state.track = function(connection)
+        state.runtimeConnections[#state.runtimeConnections + 1] = connection
+        return connection
+    end
+    state.untrack = function(connection)
+        local index = table.find(state.runtimeConnections, connection)
+        if index then table.remove(state.runtimeConnections, index) end
+    end
     local function initialize()
         local function number(value, fallback)
             return type(value) == "number" and value == value and math.abs(value) < math.huge and value or fallback
@@ -50,7 +59,8 @@ do
         history.runs = math.max(0, math.floor(number(history.runs, 0))) + 1
         state.history, state.lines, state.startedAt = history, history.lines, history.startedAt
         history.owner = state
-        state.build = "firefly-workbench-v1"
+        state.build = "jar-predictive-capture-v5"
+        history.blatantLines = type(history.blatantLines) == "table" and history.blatantLines or {}
         state.fileName = "firefly_jar_diagnostics.txt"
         state.connections, state.records, state.attempts, state.order = {}, {}, {}, {}
         state.view, state.page, state.follow = "summary", 1, true
@@ -74,18 +84,24 @@ do
             FIRST_DESCENT_OBSERVED = "Descida observada", FIRST_LANDING_OBSERVED = "Primeiro pouso observado",
             LANDED_STATE = "Superfície do pouso", LID_LANDING_HANDLER = "Contato com a tampa",
             LID_PHYSICS_CONTACT = "Contato físico com a tampa", LID_JUMP_REQUEST = "Segundo salto solicitado",
-            JUMP_REQUEST_SENT = "Comando de salto enviado", POST_DESCENT_TAKEOFF = "Segundo impulso confirmado",
+            JUMP_REQUEST_SENT = "Comando de salto enviado", POST_DESCENT_TAKEOFF = "Impulso candidato observado",
+            JAR_RESULT = "Resultado medido", MOTION_PROFILE = "Movimento antes do salto",
             RELEASE_HANDLER_ENTER = "Verificando liberação", PLAYER_UNLOCK_DONE = "Controles restaurados",
             AUTO_MOVE_STOP = "Correção de movimento encerrada", ATTEMPT_FINISH = "Tentativa encerrada",
             ACTIVATION_ERROR = "Erro de ativação", ACTIVATION_FAILED = "Ativação falhou",
             ARM_SENSOR_FAILED = "Sensor indisponível", AUTO_MOVE_FAILURE = "Aproximação interrompida",
             MOVE_WINDOW_EXPIRED = "Janela de movimento encerrada", LID_REJECTED = "Tampa descartada",
+            FACING_POLICY = "Orientação do personagem", FACING_POLICY_FAILED = "Orientação pela câmera indisponível",
+            LID_TOUCH = "Contato com o personagem", NATIVE_CONTACT_BUFFER = "Salto preparado antes da física",
+            NATIVE_RETAKEOFF_PENDING = "Novo salto nativo observado",
+            APPROACH_PREPARE = "Preparação da aproximação", APPROACH_SETTLED = "Movimento estabilizado",
         }
         local traceTags = {
             ARM_TRACE = true, AUTO_TRACE = true, AUTO_TRACE_WAIT = true, AUTO_TRACE_CLIMB = true,
             PHYSICS_CHECK = true, STATE_EVENT = true, JUMPING_EVENT = true,
             JUMP_REQUEST_ISSUE = true, JUMP_EVENT_WAIT_IMPULSE = true, STATE_EVENT_WAIT_IMPULSE = true,
             JUMP_FLAG_CLEAR = true, LID_LANDING_HANDLER = true, RELEASE_HANDLER_SKIP = true,
+            BOOST_SAMPLE = true,
         }
         local function fields(detail)
             local values = {}
@@ -106,15 +122,29 @@ do
             if not velocity or #velocity < 3 then return "movimento não registrado" end
             local x, z = velocity[1], velocity[3]
             local speed = math.sqrt(x * x + z * z)
-            if speed < 0.5 then return "parado" end
-            if not look or #look < 2 then return string.format("movimento %.1f studs/s", speed) end
-            local length = math.sqrt(look[1] * look[1] + look[2] * look[2])
-            if length < 0.01 then return "em movimento" end
-            local dot = (x * look[1] + z * look[2]) / (speed * length)
-            if dot > 0.85 then return "para frente" end
-            if dot < -0.85 then return "para trás" end
-            if math.abs(dot) < 0.35 then return "lateral" end
-            return "diagonal"
+            local description
+            if speed < 0.5 then
+                description = (tonumber(values.speedMean) or 0) >= 0.5 and "movimento variável" or "parado"
+            elseif not look or #look < 2 then
+                description = string.format("movimento %.1f studs/s", speed)
+            else
+                local length = math.sqrt(look[1] * look[1] + look[2] * look[2])
+                if length < 0.01 then
+                    description = "em movimento"
+                else
+                    local dot = (x * look[1] + z * look[2]) / (speed * length)
+                    if dot > 0.85 then description = "para frente"
+                    elseif dot < -0.85 then description = "para trás"
+                    elseif math.abs(dot) < 0.35 then description = "horizontal/de lado"
+                    else description = "diagonal" end
+                end
+            end
+            -- Reuse the measured camera motion; small camera noise is not a turn.
+            if (tonumber(values.cameraTurnDeg) or 0) >= 2 then
+                description = description .. " girando a câmera"
+                if values.mouseLocked == "true" then description = description .. " com shiftlock" end
+            end
+            return description
         end
         local function attemptFor(id, time)
             local attempt = state.attempts[id]
@@ -149,33 +179,52 @@ do
             local flags = attempt.flags
             if tag == "ACTIVATION_BEGIN" then
                 attempt.start, attempt.condition, attempt.ping = record.time, condition(values), values.ping
+            elseif tag == "MOTION_PROFILE" then
+                attempt.condition = condition(fields(detail))
+                attempt.motionMeasured = true
             elseif tag == "TOOL_ACTIVATED" then flags.activation = true
             elseif tag == "SEQUENCE_BEGIN" then flags.animation = true
             elseif tag == "FIRST_TAKEOFF_CONFIRMED" then flags.first = true
             elseif tag == "LID_BOUND" then flags.lid = true
+            elseif tag == "LID_TOUCH" then flags.touch = true
             elseif tag == "LID_JUMP_REQUEST" then flags.contact, flags.request = true, true
-            elseif tag == "POST_DESCENT_TAKEOFF" then flags.impulse = true
+            elseif tag == "POST_DESCENT_TAKEOFF" or tag == "CLIMB_ASCENT_CANDIDATE"
+                or tag == "POST_DESCENT_TAKEOFF_FALLBACK" then flags.impulse = true
             elseif tag == "RELEASE_HANDLER_ENTER" then
                 if detail:find("source=jump event with upward impulse", 1, true)
                     or detail:find("source=state event with upward impulse", 1, true)
                     or detail:find("source=physics impulse confirmed by player ascent", 1, true) then flags.impulse = true end
+            elseif tag == "JAR_RESULT" then
+                local result = fields(detail)
+                if result.outcome == "height_gain" then
+                    flags.boost, flags.impulse = true, true
+                    attempt.status, attempt.reason = "GANHO VERIFICADO", "Altura acima do primeiro salto medida; ganho=" .. (result.gain or "n/d")
+                elseif result.outcome == "no_gain" then
+                    attempt.status, attempt.reason = "SEM GANHO", "Houve impulso, mas não houve ganho de altura suficiente acima do primeiro salto"
+                else attempt.status, attempt.reason = "INCONCLUSIVO", "Medição de altura interrompida: " .. (result.reason or "sem informação") end
+                attempt.measuredResult = true
+                record.level = result.outcome == "height_gain" and "INFO" or "AVISO"
             elseif tag == "PLAYER_UNLOCK_DONE" then
                 flags.controls = true
-                if flags.request and flags.impulse then
-                    attempt.status, attempt.reason = "CONFIRMADO", "Contato e segundo impulso registrados"
-                else
-                    attempt.status, attempt.reason = "INCONCLUSIVO", "Controles liberados sem prova completa do segundo salto na tampa"
+                if not attempt.measuredResult and not attempt.errorTag then
+                    attempt.status, attempt.reason = state.importing and "SEM MEDIÇÃO" or "MEDINDO ALTURA",
+                        "Controles liberados; um impulso isolado não confirma ganho de altura"
                 end
             end
             if tag == "ATTEMPT_FINISH" or tag == "ACTIVATION_FAILED" or tag == "ACTIVATION_ERROR"
                 or tag == "ARM_SENSOR_FAILED" or tag == "AUTO_MOVE_FAILURE" then
-                attempt.status, attempt.reason, attempt.errorTag = "FALHOU", detail, tag
+                if detail:find("side-climb rebound", 1, true) then
+                    flags.impulse = true
+                    attempt.status, attempt.reason = "SEM MEDIÇÃO", "Subida após contato em Climbing; o ganho de altura não foi medido nesta versão"
+                elseif not attempt.measuredResult then attempt.status, attempt.reason = "FALHOU", detail end
+                attempt.errorTag = tag
             elseif tag == "ACTIVATION_CANCELLED" then
                 attempt.status, attempt.reason, attempt.errorTag = "CANCELADO", detail, tag
             end
             return record
         end
         local legacyAttempt = 0
+        state.importing = true
         for index, value in ipairs(history.lines) do
             local line = tostring(value)
             history.lines[index] = line
@@ -183,14 +232,16 @@ do
             local record = ingest(line, legacyAttempt)
             history.attempts = math.max(history.attempts, record.attempt)
         end
+        state.importing = false
         if #history.lines > 0 and not tostring(history.lines[1]):find("| DIAG", 1, true) then
             state.legacyNotice = "O histórico importado começa no meio da sessão; registros já descartados por versões antigas não podem ser reconstruídos."
         end
         state.selected = state.order[#state.order] or 0
         local function resultColor(attempt)
-            if attempt and attempt.status == "CONFIRMADO" then return colors.accent end
-            if attempt and attempt.status == "FALHOU" then return colors.error end
-            if attempt and (attempt.status == "INCONCLUSIVO" or attempt.status == "CANCELADO") then return colors.warn end
+            if attempt and attempt.status == "GANHO VERIFICADO" then return colors.accent end
+            if attempt and (attempt.status == "FALHOU" or attempt.status == "SEM GANHO") then return colors.error end
+            if attempt and (attempt.status == "INCONCLUSIVO" or attempt.status == "CANCELADO"
+                or attempt.status == "SEM MEDIÇÃO" or attempt.status == "MEDINDO ALTURA") then return colors.warn end
             return colors.blue
         end
         local function outcomeReason(attempt)
@@ -214,12 +265,13 @@ do
                 string.format("Registros     %d", #attempt.records), "", "ETAPAS OBSERVADAS", "",
             }
             local stages = {{"activation", "Jar ativado"}, {"animation", "Animação reconhecida"},
-                {"first", "Primeiro salto"}, {"lid", "Tampa identificada"}, {"contact", "Contato na tampa"},
-                {"request", "Segundo salto solicitado"}, {"impulse", "Segundo impulso"}, {"controls", "Controles liberados"}}
+                {"first", "Primeiro salto"}, {"lid", "Tampa identificada"}, {"touch", "Contato com personagem"}, {"contact", "Apoio no topo da tampa"},
+                {"request", "Segundo salto solicitado"}, {"impulse", "Impulso observado"}, {"boost", "Ganho de altura medido"}, {"controls", "Controles liberados"}}
             for _, stage in ipairs(stages) do
                 lines[#lines + 1] = string.format("  %-13s %s", attempt.flags[stage[1]] and "OK" or "não observado", stage[2])
             end
             if attempt.errorTag then lines[#lines + 1] = "Origem: " .. attempt.errorTag end
+            if not attempt.motionMeasured then lines[#lines + 1] = "Movimento acima: somente o instante da ativação." end
             lines[#lines + 1] = "\nEtapa não observada não significa causa comprovada."
             return table.concat(lines, "\n")
         end
@@ -258,6 +310,7 @@ do
                 "FIREFLY JAR / DIAGNÓSTICO COMPLETO", "Build: " .. state.build,
                 string.format("Execuções: %d | Tentativas: %d | Registros: %d | Limpezas explícitas: %d",
                     history.runs, #state.order, #history.lines, history.clears),
+                string.format("Arquivo Blatant: %d eventos de arremesso/impulso", #history.blatantLines),
                 "Retenção: sem descarte automático. Os registros brutos abaixo são integrais.",
             }
             if state.legacyNotice then output[#output + 1] = "Aviso de importação: " .. state.legacyNotice end
@@ -270,13 +323,22 @@ do
             for _, id in ipairs(state.order) do output[#output + 1] = "\n" .. summary(state.attempts[id]) end
             output[#output + 1] = "\nREGISTROS BRUTOS INTEGRAIS / ORDEM CRONOLÓGICA\n"
             output[#output + 1] = table.concat(history.lines, "\n")
+            output[#output + 1] = "\nBOMB BLATANT / CICLO DO IMPULSO / SEM PAINEL ADICIONAL\n"
+            output[#output + 1] = table.concat(history.blatantLines, "\n")
             return table.concat(output, "\n")
         end
         state.persist = function()
-            if history.owner ~= state or #history.lines == 0 or type(writefile) ~= "function" then return false end
+            if history.owner ~= state or (#history.lines == 0 and #history.blatantLines == 0)
+                or type(writefile) ~= "function" then return false end
             local ok = pcall(writefile, state.fileName, state.export())
             state.fileSaved = ok
             return ok
+        end
+        state.logBomb = function(tag, detail)
+            if state.stopped or history.owner ~= state then return end
+            history.blatantLines[#history.blatantLines + 1] = string.format("+%.3fs | %s | %s",
+                os.clock() - state.startedAt, tostring(tag), tostring(detail or ""))
+            if tag == "AIR_FAILED" or tag == "AIR_CONFIRMED" then task.defer(function() state.persist() end) end
         end
         local function status(message)
             state.notice = message
@@ -459,7 +521,9 @@ do
         end
         state.layout = layout
         local function clearHistory()
+            if state.activeGainMonitor then pcall(state.activeGainMonitor) end
             table.clear(history.lines)
+            table.clear(history.blatantLines)
             state.records, state.attempts, state.order = {}, {}, {}
             history.startedAt, history.attempts = os.clock(), 0
             history.clears += 1
@@ -592,18 +656,20 @@ do
             state.attempt = history.attempts
             if state.follow then state.selected, state.page = state.attempt, 1 end
         end
-        state.log = function(tag, detail)
+        state.log = function(tag, detail, attemptOverride)
             local name = tostring(tag)
-            if state.stopped or not state.enabled or name:sub(1, 5) == "BOMB_" or name:sub(1, 7) == "NORMAL_"
+            if state.stopped or (not state.enabled and name ~= "JAR_RESULT" and name ~= "BOOST_SAMPLE")
+                or name:sub(1, 5) == "BOMB_" or name:sub(1, 7) == "NORMAL_"
                 or name:sub(1, 8) == "BLATANT_" or name == "THROW" or name == "HAND" or name == "FLOOR"
                 or name == "JUMP_SETTINGS" or name == "NO_BOMB_OBSERVED" then return end
-            local line = string.format("+%.3fs | %s | attempt=%d%s", os.clock() - state.startedAt, name, state.attempt or 0,
+            local id = tonumber(attemptOverride) or state.attempt or 0
+            local line = string.format("+%.3fs | %s | attempt=%d%s", os.clock() - state.startedAt, name, id,
                 detail ~= nil and ("; " .. tostring(detail)) or "")
             history.lines[#history.lines + 1] = line
-            ingest(line, state.attempt)
+            ingest(line, id)
             requestRefresh()
             if (name == "ATTEMPT_FINISH" or name == "PLAYER_UNLOCK_DONE" or name == "ACTIVATION_FAILED"
-                or name == "ACTIVATION_ERROR") and not state.persistQueued then
+                or name == "ACTIVATION_ERROR" or name == "JAR_RESULT") and not state.persistQueued then
                 state.persistQueued = true
                 task.defer(function() state.persistQueued = false; state.persist() end)
             end
@@ -636,6 +702,7 @@ do
     if not ok then
         state.initError = tostring(err)
         state.log = function() end
+        state.logBomb = function() end
         state.beginAttempt = function() end
         state.setEnabled = function() end
         state.persist = function() return false end
@@ -708,6 +775,9 @@ pcall(function()
         if typeof(originalWalkSpeed) == "number" then
             humanoid.WalkSpeed = originalWalkSpeed
         end
+        local autoRotate = humanoid:GetAttribute("__FireflyMovementLockAutoRotate")
+        if typeof(autoRotate) == "boolean" then humanoid.AutoRotate = autoRotate end
+        humanoid:SetAttribute("__FireflyMovementLockAutoRotate", nil)
         humanoid:SetAttribute("__FireflyMovementLockWalkSpeed", nil)
         humanoid:SetAttribute("__FireflyMovementLockActive", nil)
         humanoid.Jump = false
@@ -1509,7 +1579,7 @@ bombButton.InputChanged:Connect(function(input)
     end
 end)
 
-UIS.InputChanged:Connect(function(input)
+fireflyDiag.runtimeConnections[#fireflyDiag.runtimeConnections + 1] = UIS.InputChanged:Connect(function(input)
     if lockBombPosition or not draggingBomb then
         return
     end
@@ -1995,7 +2065,7 @@ titleBar.InputChanged:Connect(function(input)
     end
 end)
 
-UIS.InputChanged:Connect(function(input)
+fireflyDiag.runtimeConnections[#fireflyDiag.runtimeConnections + 1] = UIS.InputChanged:Connect(function(input)
     if not menuDragging then
         return
     end
@@ -2050,6 +2120,7 @@ local function getBombToolName()
 end
 
 local BombStyleRuntime = {}
+BombStyleRuntime.active = true
 
 BombStyleRuntime.isDescending = function(humanoid, rootPart)
     if not humanoid or not rootPart or humanoid.Health <= 0 then
@@ -3133,6 +3204,14 @@ local function getFireflyRootHeight(character, humanoid, rootPart)
     return height
 end
 
+BombStyleRuntime.jarTopPoint = function(lid, position, translation)
+    local up = lid.CFrame.UpVector
+    local top = lid.Position + (translation or Vector3.zero) + up * (lid.Size.Y * 0.5)
+    if math.abs(up.Y) < 0.05 then return top, false end
+    local y = top.Y - (up.X * (position.X - top.X) + up.Z * (position.Z - top.Z)) / up.Y
+    return Vector3.new(position.X, y, position.Z), up.Y >= 0.7
+end
+
 local function getFireflyJumpConfirmationSpeed(humanoid)
     local speed = humanoid.UseJumpPower and humanoid.JumpPower
         or math.sqrt(math.max(0, 2 * Workspace.Gravity * humanoid.JumpHeight))
@@ -3168,18 +3247,30 @@ end
 local function stopFireflyForwardMovement()
     local wasActive = fireflyDoubleJumpForwardConnection ~= nil
     fireflyDoubleJumpForwardConnection = nil
+    BombStyleRuntime.jarStepMovement = nil
+    BombStyleRuntime.jarContactForecast = nil
     RunService:UnbindFromRenderStep(Config.FIREFLY_FORWARD_MOVEMENT_BIND_NAME)
     if wasActive then
         fireflyDiag.log("AUTO_MOVE_STOP", "forward RenderStep unbound")
     end
 end
 
-local function startFireflyForwardMovement(character, humanoid, rootPart, movementStartAt, onWindowStarted, onWindowEnded, onFailure)
-    local function getFireflyLandingTime(feetGap, relativeVerticalVelocity, gravity)
+local function startFireflyForwardMovement(character, humanoid, rootPart, movementStartAt, onWindowStarted, onWindowEnded, onFailure, launchMovement)
+    local function getFireflyLandingTime(feetGap, relativeVerticalVelocity, gravity, firstCrossing)
         -- Keep the signed gap: feet already below the top are not a zero-height landing.
-        -- A valid solution must cross the top while descending relative to the lid.
+        -- Both free objects accelerate under gravity: their relative acceleration is zero.
+        if gravity < 0.001 then
+            if math.abs(relativeVerticalVelocity) < 0.001 then return nil end
+            local time = -feetGap / relativeVerticalVelocity
+            if time < 0 or (not firstCrossing and relativeVerticalVelocity >= 0) then return nil end
+            return time
+        end
         local discriminant = relativeVerticalVelocity * relativeVerticalVelocity + 2 * gravity * feetGap
         if discriminant < 0 then return nil end
+        if firstCrossing then
+            local ascendingTime = (relativeVerticalVelocity - math.sqrt(discriminant)) / gravity
+            if ascendingTime >= 0 then return ascendingTime end
+        end
         local time = (relativeVerticalVelocity + math.sqrt(discriminant)) / gravity
         if time < 0 or relativeVerticalVelocity - gravity * time > 0 then return nil end
         return time
@@ -3191,22 +3282,43 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
     local deadline = nil
     local nextAutoTraceAt = 0
     local climbingSince = nil
+    local lastBodyNearLidAt = nil
+    local lidFirstSeenAt = nil
+    local initialMovement = launchMovement or Vector3.zero
+    initialMovement = Vector3.new(initialMovement.X, 0, initialMovement.Z)
+    if initialMovement.Magnitude < 1.25 then initialMovement = Vector3.zero end
+    local lastMovement = initialMovement / math.max(humanoid.WalkSpeed, 1)
+    if lastMovement.Magnitude > 1 then lastMovement = lastMovement.Unit end
+    local function carryLaunchMovement()
+        local move = initialMovement / math.max(humanoid.WalkSpeed, 1)
+        if move.Magnitude > 1 then move = move.Unit end
+        lastMovement = move
+        humanoid:Move(move, false)
+    end
     local velocitySamplePart = nil
     local velocitySamplePosition = nil
     local velocitySampleAt = 0
+    local lidSamples = {}
     local measuredLidVelocity = Vector3.zero
     local measuredLidVelocityValid = false
     local measuredLowSpeedSamples = 0
+    local measuredVelocityMidpoint, measuredVelocitySpan = 0, 0
+    local previousDistinctVelocity = nil
+    local ballisticPairValid = false
+    local function sendMovement(direction)
+        lastMovement = direction
+        humanoid:Move(direction, false)
+    end
     local lidRayParams = RaycastParams.new()
     lidRayParams.FilterType = Enum.RaycastFilterType.Exclude
     lidRayParams.IgnoreWater = true
     fireflyDoubleJumpForwardConnection = true
-    fireflyDiag.log("AUTO_MOVE_START", "forward RenderStep bound; startAt=" .. string.format("%.3f", startAt))
+    fireflyDiag.log("AUTO_MOVE_START", "physics steering + render input ownership; startAt=" .. string.format("%.3f", startAt))
 
     local function stopWithFailure(message)
         fireflyDiag.log("AUTO_MOVE_FAILURE", tostring(message))
         pcall(function()
-            humanoid:Move(Vector3.zero, false)
+            sendMovement(Vector3.zero)
         end)
         stopFireflyForwardMovement()
         if onFailure then
@@ -3214,10 +3326,8 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
         end
     end
 
-    RunService:BindToRenderStep(
-        Config.FIREFLY_FORWARD_MOVEMENT_BIND_NAME,
-        Enum.RenderPriority.Last.Value + 1,
-        function()
+    local function stepSteering(deltaTime)
+            BombStyleRuntime.jarContactForecast = nil
             if not fireflyDoubleJumpForwardConnection then
                 return
             end
@@ -3226,7 +3336,26 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 stopWithFailure("Firefly: character unavailable")
                 return
             end
+            if BombStyleRuntime.applyJarFacing and not BombStyleRuntime.applyJarFacing() then
+                stopWithFailure("Firefly: camera-facing policy unavailable")
+                return
+            end
             local currentState = humanoid:GetState()
+            local bodyLid = fireflyDoubleJumpLid
+            if bodyLid and bodyLid:IsA("BasePart") and bodyLid.Parent == Workspace then
+                local p, lp, size, cf = rootPart.Position, bodyLid.Position, bodyLid.Size, bodyLid.CFrame
+                local planarGap = Vector3.new(p.X - lp.X, 0, p.Z - lp.Z).Magnitude
+                local radius = math.max(size.X, size.Z) * 0.5 + math.max(rootPart.Size.X, rootPart.Size.Z) * 0.5 + 0.65
+                local extentY = (math.abs(cf.RightVector.Y) * size.X + math.abs(cf.UpVector.Y) * size.Y
+                    + math.abs(cf.LookVector.Y) * size.Z) * 0.5
+                local bodyTopY = p.Y + rootPart.Size.Y
+                local head = character:FindFirstChild("Head")
+                if head and head:IsA("BasePart") then bodyTopY = math.max(bodyTopY, head.Position.Y + head.Size.Y * 0.5) end
+                if planarGap <= radius and lp.Y + extentY >= p.Y - getFireflyRootHeight(character, humanoid, rootPart) - 0.65
+                    and lp.Y - extentY <= bodyTopY + 0.65 then
+                    lastBodyNearLidAt = now
+                end
+            end
             if currentState == Enum.HumanoidStateType.Climbing then
                 local traceLid = fireflyDoubleJumpLid
                 local traceRootPosition = rootPart.Position
@@ -3249,9 +3378,18 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                         + math.max(rootPart.Size.X, rootPart.Size.Z) * 0.5 + 0.65
                     nearLid = horizontalDistance <= horizontalGraceRadius
                         and feetGap >= -1.25 and feetGap <= 1.75
+                    -- This is only a bounded recovery window for BODY contact.
+                    -- Feet-level proximity is required for a jump, not for recognizing
+                    -- that a nearby lid just brushed the torso/head during flight.
+                    nearLid = nearLid or (lastBodyNearLidAt ~= nil and now - lastBodyNearLidAt <= 0.12)
+                    local touch = BombStyleRuntime.jarLastContact
+                    nearLid = nearLid or (touch and touch.lid == traceLid and now - touch.time <= 0.12)
                 end
 
                 if not nearLid then
+                    fireflyDiag.log("CLIMBING_REJECT_GEOMETRY", string.format(
+                        "horizontalDistance=%.2f; feetGap=%.2f; rootY=%.2f; lidY=%.2f; recentBody=%s",
+                        horizontalDistance, feetGap, traceRootPosition.Y, traceLidPosition.Y, tostring(lastBodyNearLidAt and now-lastBodyNearLidAt)))
                     stopWithFailure("Firefly: climbing away from lid; attempt canceled safely")
                     return
                 end
@@ -3259,7 +3397,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 if not climbingSince then
                     climbingSince = now
                     fireflyDiag.log("CLIMBING_GRACE_BEGIN", string.format(
-                        "brief climbing contact near lid; horizontalDistance=%.2f; feetGap=%.2f; grace=0.18s",
+                        "brief body proximity; jump not authorized; horizontalDistance=%.2f; feetGap=%.2f; grace=0.18s",
                         horizontalDistance, feetGap
                     ))
                 elseif now - climbingSince >= 0.18 then
@@ -3284,12 +3422,12 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             end
 
             if now < startAt then
-                humanoid:Move(Vector3.zero, false)
+                carryLaunchMovement()
                 if now >= nextAutoTraceAt then
                     nextAutoTraceAt = now + 0.10
                     fireflyDiag.log("AUTO_TRACE_WAIT", string.format(
-                        "before startAt; state=%s; startAt=%.3f; now=%.3f; rootY=%.2f; floor=%s",
-                        tostring(currentState), startAt, now, rootPart.Position.Y, tostring(humanoid.FloorMaterial)
+                        "before startAt; state=%s; startAt=%.3f; now=%.3f; rootY=%.2f; floor=%s; carry=(%.2f,%.2f)",
+                        tostring(currentState), startAt, now, rootPart.Position.Y, tostring(humanoid.FloorMaterial), initialMovement.X, initialMovement.Z
                     ))
                 end
                 return
@@ -3297,56 +3435,72 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
 
             local lid = fireflyDoubleJumpLid
             if not lid or not lid:IsA("BasePart") or lid.Parent ~= Workspace then
-                humanoid:Move(Vector3.zero, false)
+                carryLaunchMovement()
                 if now >= startAt + 1.25 then
                     stopWithFailure("Firefly: lid not detected")
                 end
                 return
             end
+            lidFirstSeenAt = lidFirstSeenAt or now
 
             lidRayParams.FilterDescendantsInstances = {character, lid}
             local floorHit = Workspace:Raycast(lid.Position, Vector3.new(0, -64, 0), lidRayParams)
-            local bottomGap = floorHit and (lid.Position.Y - lid.Size.Y * 0.5 - floorHit.Position.Y) or math.huge
+            local lidFrame, lidSize = lid.CFrame, lid.Size
+            local verticalExtent = (math.abs(lidFrame.RightVector.Y) * lidSize.X
+                + math.abs(lidFrame.UpVector.Y) * lidSize.Y + math.abs(lidFrame.LookVector.Y) * lidSize.Z) * 0.5
+            local bottomGap = floorHit and (lid.Position.Y - verticalExtent - floorHit.Position.Y) or math.huge
             local reportedLidVelocity = lid.AssemblyLinearVelocity
+            local gravity = math.max(Workspace.Gravity, 1)
 
-            -- AssemblyLinearVelocity can be stale or misleading for replicated/anchored lid parts.
-            -- Estimate horizontal motion from the part's actual observed displacement over a short window.
+            -- Position replication can hold a pose for several rendered frames.
+            -- Estimate from distinct positions, then retain that motion briefly instead
+            -- of interpreting each held frame as a newly stationary lid.
             if velocitySamplePart ~= lid or not velocitySamplePosition then
-                velocitySamplePart = lid
-                velocitySamplePosition = lid.Position
-                velocitySampleAt = now
-                measuredLidVelocity = Vector3.zero
-                measuredLidVelocityValid = false
-                measuredLowSpeedSamples = 0
-            else
-                local sampleDt = now - velocitySampleAt
-                if sampleDt >= 0.03 and sampleDt <= 0.20 then
-                    local observedVelocity = (lid.Position - velocitySamplePosition) / sampleDt
-                    if observedVelocity.Magnitude <= 100 then
-                        measuredLidVelocity = observedVelocity
-                        measuredLidVelocityValid = true
-                        local observedHorizontalSpeed = Vector3.new(
-                            observedVelocity.X, 0, observedVelocity.Z
-                        ).Magnitude
-                        if observedHorizontalSpeed <= 1.0 then
-                            measuredLowSpeedSamples = measuredLowSpeedSamples + 1
-                        else
-                            measuredLowSpeedSamples = 0
-                        end
-                    else
-                        measuredLidVelocityValid = false
-                        measuredLowSpeedSamples = 0
+                velocitySamplePart, velocitySamplePosition, velocitySampleAt = lid, lid.Position, now
+                lidSamples = {{time = now, position = lid.Position}}
+                measuredLidVelocity, measuredLidVelocityValid, measuredLowSpeedSamples = Vector3.zero, false, 0
+                measuredVelocityMidpoint, measuredVelocitySpan = now, 0
+                previousDistinctVelocity, ballisticPairValid = reportedLidVelocity, false
+            elseif (lid.Position - velocitySamplePosition).Magnitude > 0.005 then
+                -- Velocity/position energy is independent of packet arrival spacing.
+                -- A held pose followed by a burst must not turn an average secant
+                -- into the lid's current vertical speed.
+                local before = lidSamples[#lidSamples]
+                local oldVy = previousDistinctVelocity and previousDistinctVelocity.Y
+                local flightDt = oldVy and (oldVy - reportedLidVelocity.Y) / gravity or 0
+                local dy = lid.Position.Y - before.position.Y
+                ballisticPairValid = not lid.Anchored and flightDt > 0.001 and flightDt <= 0.35
+                    and math.abs(dy) > 0.005
+                    and math.abs(dy - (oldVy + reportedLidVelocity.Y) * 0.5 * flightDt)
+                        <= math.max(0.12, math.abs(dy) * 0.12)
+                previousDistinctVelocity = reportedLidVelocity
+                velocitySamplePosition, velocitySampleAt = lid.Position, now
+                lidSamples[#lidSamples + 1] = {time = now, position = lid.Position}
+                while #lidSamples > 2 and now - lidSamples[2].time > 0.12 do table.remove(lidSamples, 1) end
+                local first, last = lidSamples[1], lidSamples[#lidSamples]
+                local dt = last.time - first.time
+                if dt > 0.0001 and dt <= 0.25 then
+                    local observed = (last.position - first.position) / dt
+                    measuredLidVelocityValid = observed.Magnitude <= 100
+                    if measuredLidVelocityValid then
+                        measuredLidVelocity = observed
+                        measuredVelocityMidpoint, measuredVelocitySpan = (first.time + last.time) * 0.5, dt
                     end
-                    velocitySamplePosition = lid.Position
-                    velocitySampleAt = now
-                elseif sampleDt > 0.20 then
-                    -- The sample window went stale; re-baseline instead of extrapolating old motion.
-                    velocitySamplePosition = lid.Position
-                    velocitySampleAt = now
-                    measuredLidVelocity = Vector3.zero
-                    measuredLidVelocityValid = false
-                    measuredLowSpeedSamples = 0
+                else measuredLidVelocityValid = false end
+                if ballisticPairValid then
+                    local physicalAverage = (lid.Position - before.position) / flightDt
+                    if physicalAverage.Magnitude <= 100 then
+                        measuredLidVelocity, measuredLidVelocityValid = physicalAverage, true
+                        measuredVelocityMidpoint, measuredVelocitySpan = now - flightDt * 0.5, flightDt
+                    end
                 end
+                measuredLowSpeedSamples = 0
+            elseif now - velocitySampleAt >= 0.12 then
+                measuredLidVelocity, measuredLidVelocityValid = Vector3.zero, true
+                measuredLowSpeedSamples += 1
+                lidSamples = {{time = now, position = lid.Position}}
+                measuredVelocityMidpoint, measuredVelocitySpan = now, 0
+                ballisticPairValid = false
             end
 
             -- The lateral failure reported 14 studs/s while the visible/collidable lid
@@ -3362,17 +3516,56 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             local measuredHorizontalSpeed = measuredHorizontalVelocity.Magnitude
             local reportedVelocityIsPlausible = reportedHorizontalSpeed >= 1.25
                 and reportedHorizontalSpeed <= 24.0
+            local distinctMotionObserved = measuredLidVelocityValid and #lidSamples > 1
+                and now - velocitySampleAt <= 0.12
+            local horizontalReportCorroborated = distinctMotionObserved and reportedVelocityIsPlausible
+                and measuredHorizontalSpeed > 0.5
+                and reportedHorizontalVelocity:Dot(measuredHorizontalVelocity) > 0
+                and (reportedHorizontalVelocity - measuredHorizontalVelocity).Magnitude
+                    <= math.max(3, reportedHorizontalSpeed * 0.45)
             local horizontalLidVelocity = Vector3.zero
             local horizontalVelocitySource = "awaiting-position-sample"
             if measuredLidVelocityValid then
                 horizontalLidVelocity = measuredHorizontalVelocity
                 horizontalVelocitySource = "measured"
             end
+            if horizontalReportCorroborated then
+                horizontalLidVelocity = reportedHorizontalVelocity
+                horizontalVelocitySource = "position-corroborated-report"
+            elseif #lidSamples == 1 and now - lidFirstSeenAt <= 0.20 and not lid.Anchored
+                and initialMovement.Magnitude >= 1.25 and reportedVelocityIsPlausible
+                and reportedHorizontalSpeed >= initialMovement.Magnitude * 0.5
+                and reportedHorizontalSpeed <= initialMovement.Magnitude * 1.5
+                and reportedHorizontalVelocity:Dot(initialMovement) >= reportedHorizontalSpeed * initialMovement.Magnitude * 0.9 then
+                -- A bounded motion prior, explicitly distinct from measured lid motion.
+                -- Continuing the incoming trajectory avoids braking from 16 to 0 while
+                -- the first replication pose is held. Stationary/mismatching reports
+                -- still receive no unobserved lead.
+                horizontalLidVelocity = reportedHorizontalVelocity
+                horizontalVelocitySource = "launch-motion-prior"
+            end
             local selectedLidVerticalVelocity = 0
             local lidVerticalVelocitySource = "awaiting-position-sample"
             if measuredLidVelocityValid then
                 selectedLidVerticalVelocity = measuredLidVelocity.Y
                 lidVerticalVelocitySource = "measured"
+            end
+            -- A displacement/window velocity belongs at the window midpoint.
+            -- Comparing it directly with current velocity creates a ~12 stud/s lag.
+            local currentBallisticVy = measuredLidVelocity.Y - gravity * (now - measuredVelocityMidpoint)
+            local lidAtFloor = floorHit ~= nil and bottomGap >= -0.08 and bottomGap <= 0.18
+                and (math.abs(reportedLidVelocity.Y) <= 1.5
+                    or (measuredLidVelocityValid and measuredLidVelocity.Magnitude <= 1.5))
+            local lidIsBallistic = not lid.Anchored and not lidAtFloor and distinctMotionObserved
+                and math.abs(lidSamples[#lidSamples].position.Y - lidSamples[1].position.Y) > 0.01
+                and (ballisticPairValid or math.abs(reportedLidVelocity.Y - currentBallisticVy)
+                    <= math.max(5, gravity * measuredVelocitySpan * 0.5))
+            if lidIsBallistic then
+                selectedLidVerticalVelocity = reportedLidVelocity.Y
+                lidVerticalVelocitySource = "ballistic-position-corroborated-report"
+            elseif lidAtFloor then
+                selectedLidVerticalVelocity = 0
+                lidVerticalVelocitySource = "floor-contact"
             end
 
             local lidVelocity = Vector3.new(
@@ -3387,15 +3580,35 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
 
             local rootHeightAboveGround = getFireflyRootHeight(character, humanoid, rootPart)
 
-            local lidTopY = lid.Position.Y + lid.Size.Y * 0.5
-            local feetGap = rootPart.Position.Y - rootHeightAboveGround - lidTopY
+            local surfacePoint, surfaceUpright = BombStyleRuntime.jarTopPoint(lid, rootPart.Position)
+            local feetGap = rootPart.Position.Y - rootHeightAboveGround - surfacePoint.Y
+            local lidTopCenter = lid.Position + lid.CFrame.UpVector * (lid.Size.Y * 0.5)
+            -- Steering aims at the finite support, not the infinite extension of
+            -- a tilted plane many studs away from it.
+            local targetFeetGap = rootPart.Position.Y - rootHeightAboveGround - lidTopCenter.Y
             local rootVelocity = rootPart.AssemblyLinearVelocity
             local verticalVelocity = rootVelocity.Y
             local relativeVerticalVelocity = verticalVelocity - lidVelocity.Y
-            local gravity = math.max(Workspace.Gravity, 1)
-            local expectedLandingTime = getFireflyLandingTime(feetGap, relativeVerticalVelocity, gravity)
+            local relativeGravity = lidIsBallistic and 0 or gravity
+            local expectedLandingTime = getFireflyLandingTime(targetFeetGap, relativeVerticalVelocity, relativeGravity)
+            local alignmentTime = getFireflyLandingTime(targetFeetGap, relativeVerticalVelocity, relativeGravity, true)
+            local lidFloorTime = nil
+            if lidIsBallistic and floorHit and bottomGap >= 0 then
+                lidFloorTime = getFireflyLandingTime(bottomGap, lidVelocity.Y, gravity)
+                -- After the lid reaches the floor it stops falling with the player.
+                -- Solve the subsequent support crossing on that stationary plane.
+                local floorLandingTime = getFireflyLandingTime(targetFeetGap + bottomGap, verticalVelocity, gravity)
+                if expectedLandingTime and lidFloorTime and expectedLandingTime > lidFloorTime then expectedLandingTime = nil end
+                if alignmentTime and lidFloorTime and alignmentTime > lidFloorTime then alignmentTime = nil end
+                if floorLandingTime and lidFloorTime and floorLandingTime >= lidFloorTime then
+                    expectedLandingTime = expectedLandingTime or floorLandingTime
+                    alignmentTime = alignmentTime or floorLandingTime
+                end
+            end
             local landingReachable = expectedLandingTime ~= nil
-            local predictedLandingTime = landingReachable and math.clamp(expectedLandingTime, 0, 0.35) or 0
+            -- Horizontal alignment can be needed on the earlier upward crossing;
+            -- that crossing alone never authorizes a second jump.
+            local predictedLandingTime = math.clamp(alignmentTime or expectedLandingTime or 0, 0, 0.35)
 
             if not deadline then
                 local holdTime = math.clamp((expectedLandingTime or 0) + Config.FIREFLY_SECOND_JUMP_CONFIRM_TIME,
@@ -3406,7 +3619,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 if onWindowStarted then onWindowStarted(deadline) end
             end
             if now >= deadline then
-                pcall(function() humanoid:Move(Vector3.zero, false) end)
+                pcall(function() sendMovement(Vector3.zero) end)
                 stopFireflyForwardMovement()
                 if onWindowEnded then onWindowEnded() end
                 return
@@ -3423,18 +3636,22 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             local predictedLidCFrame = lid.CFrame + leadOffset
             local horizontalRootVelocity = Vector3.new(rootVelocity.X, 0, rootVelocity.Z)
             local relativeHorizontalVelocity = horizontalRootVelocity - horizontalLidVelocity
-            local rootLeadTime = math.min(predictedLandingTime, 0.08)
+            local frameTime = math.clamp(tonumber(deltaTime) or 1 / 60, 1 / 240, 1 / 15)
+            local rootLeadTime = math.min(predictedLandingTime * 0.25, frameTime)
             local predictedRootLandingPosition = rootPart.Position
                 + horizontalRootVelocity * predictedLandingTime
             local predictedRootAtLanding = Vector3.new(
                 predictedRootLandingPosition.X,
-                predictedLidPosition.Y + lid.Size.Y * 0.5 + rootHeightAboveGround,
+                predictedLidPosition.Y,
                 predictedRootLandingPosition.Z
             )
+            -- Project FEET vertically onto the actual tilted top plane. Projecting
+            -- a root center ~3 studs above it invents a lateral miss under tilt.
+            predictedRootAtLanding = BombStyleRuntime.jarTopPoint(lid, predictedRootAtLanding, leadOffset)
             local horizontalOffset = Vector3.new(
-                lid.Position.X - rootPart.Position.X,
+                lidTopCenter.X - rootPart.Position.X,
                 0,
-                lid.Position.Z - rootPart.Position.Z
+                lidTopCenter.Z - rootPart.Position.Z
             )
             local predictedLocalPosition = predictedLidCFrame:PointToObjectSpace(predictedRootAtLanding)
             local safeHalfX = math.max(
@@ -3447,6 +3664,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             )
             local predictedWithinLandingFootprint = math.abs(predictedLocalPosition.X) <= safeHalfX
                 and math.abs(predictedLocalPosition.Z) <= safeHalfZ
+                and surfaceUpright
             local descendingIntoLid = landingReachable and relativeVerticalVelocity <= -1.0
                 and feetGap >= -0.25
                 and feetGap <= 2.2
@@ -3455,15 +3673,14 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
 
             local direction = Vector3.zero
             local captureRadius = math.clamp(math.min(lid.Size.X, lid.Size.Z) * 0.12, 0.16, 0.32)
-            local remainingLandingTime = math.max(predictedLandingTime - rootLeadTime, 0.08)
+            local remainingLandingTime = math.max(predictedLandingTime - rootLeadTime, frameTime)
             -- Work in the lid's moving reference frame. The future lid displacement
             -- is already represented by its velocity; do not add that lead twice.
             local desiredRelativeVelocity = (horizontalOffset - relativeHorizontalVelocity * rootLeadTime)
                 / remainingLandingTime
             local maximumCorrectionSpeed = math.max(humanoid.WalkSpeed, 1)
-            if desiredRelativeVelocity.Magnitude > maximumCorrectionSpeed then
-                desiredRelativeVelocity = desiredRelativeVelocity.Unit * maximumCorrectionSpeed
-            end
+            -- WalkSpeed bounds WORLD velocity. Capping the relative correction first
+            -- can reverse a reachable command when the lid moves towards the player.
             local desiredWorldVelocity = horizontalLidVelocity + desiredRelativeVelocity
             local requestedWorldSpeed = desiredWorldVelocity.Magnitude
             if desiredWorldVelocity.Magnitude > maximumCorrectionSpeed then
@@ -3472,6 +3689,26 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
             local canSettleOnLid = descendingIntoLid
                 and predictedWithinLandingFootprint
                 and relativeHorizontalVelocity.Magnitude <= 1.15
+
+            -- Forecast the actual coasting feet/top intersection for one physics
+            -- step. This only buffers normal Jump input; it never grants support.
+            if surfaceUpright and feetGap >= -0.25 then
+                local up = lid.CFrame.UpVector
+                local planeRelativeVy = relativeVerticalVelocity
+                    + (up.X * relativeHorizontalVelocity.X + up.Z * relativeHorizontalVelocity.Z) / up.Y
+                local contactTime = getFireflyLandingTime(feetGap, planeRelativeVy, relativeGravity)
+                local stepTime = math.clamp(tonumber(deltaTime) or 1 / 60, 1 / 240, 0.1)
+                if contactTime and contactTime <= stepTime + 1 / 240 then
+                    local translation = lidVelocity * contactTime
+                        + Vector3.new(0, lidIsBallistic and -0.5 * gravity * contactTime * contactTime or 0, 0)
+                    local futureRoot = rootPart.Position + horizontalRootVelocity * contactTime
+                    local futureFoot = BombStyleRuntime.jarTopPoint(lid, futureRoot, translation)
+                    local localFoot = (lid.CFrame + translation):PointToObjectSpace(futureFoot)
+                    if math.abs(localFoot.X) <= safeHalfX and math.abs(localFoot.Z) <= safeHalfZ then
+                        BombStyleRuntime.jarContactForecast = {lid = lid, observedAt = now, time = contactTime}
+                    end
+                end
+            end
 
             if canSettleOnLid then
                 direction = horizontalLidVelocity / maximumCorrectionSpeed
@@ -3487,7 +3724,8 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 end
             end
 
-            if feetGap < Config.FIREFLY_LID_APPROACH_CLEARANCE then
+            if feetGap >= -0.25 and feetGap < Config.FIREFLY_LID_APPROACH_CLEARANCE
+                and relativeVerticalVelocity <= 1 then
                 if predictedWithinLandingFootprint then
                     -- Move is a target movement, not an acceleration command. Match
                     -- the support's velocity instead of commanding a backwards walk.
@@ -3503,7 +3741,7 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                 end
             end
 
-            humanoid:Move(direction, false)
+            sendMovement(direction)
             if now >= nextAutoTraceAt then
                 nextAutoTraceAt = now + 0.10
                 fireflyDiag.log("AUTO_TRACE", string.format(
@@ -3529,10 +3767,24 @@ local function startFireflyForwardMovement(character, humanoid, rootPart, moveme
                     rootPart.CFrame.LookVector.X, rootPart.CFrame.LookVector.Z, math.max(0,deadline-now),
                     tostring(landingReachable), verticalVelocity, lid.Size.X, lid.Size.Y, lid.Size.Z,
                     lid.CFrame.UpVector.X, lid.CFrame.UpVector.Y, lid.CFrame.UpVector.Z
-                ))
+                ) .. string.format("; relativeGravity=%.2f; alignmentT=%s; supportT=%s; lidFloorT=%s; mouseLocked=%s; targetFeetGap=%.2f; ballisticPair=%s",
+                    relativeGravity, tostring(alignmentTime), tostring(expectedLandingTime), tostring(lidFloorTime),
+                    tostring(UIS.MouseBehavior == Enum.MouseBehavior.LockCenter), targetFeetGap, tostring(ballisticPairValid)))
             end
+    end
+    BombStyleRuntime.jarStepMovement = stepSteering
+    RunService:BindToRenderStep(Config.FIREFLY_FORWARD_MOVEMENT_BIND_NAME, Enum.RenderPriority.Last.Value + 1, function(deltaTime)
+        if not fireflyDoubleJumpForwardConnection then return end
+        if BombStyleRuntime.jarBeforePhysics then
+            if BombStyleRuntime.applyJarFacing and not BombStyleRuntime.applyJarFacing() then
+                stopWithFailure("Firefly: camera-facing policy unavailable")
+                return
+            end
+            if character.Parent and humanoid.Parent and humanoid.Health > 0 then humanoid:Move(lastMovement, false) end
+        else
+            stepSteering(deltaTime)
         end
-    )
+    end)
 end
 
 local function bindFireflyLid(lid)
@@ -3549,6 +3801,16 @@ local function bindFireflyLid(lid)
 end
 
 local cancelFireflyDoubleJump = function(preserveJump)
+    BombStyleRuntime.applyJarFacing = nil
+    if BombStyleRuntime.jarBeforePhysics then
+        BombStyleRuntime.jarBeforePhysics:Disconnect()
+        BombStyleRuntime.jarBeforePhysics = nil
+    end
+    if BombStyleRuntime.jarTouchConnection then
+        BombStyleRuntime.jarTouchConnection:Disconnect()
+        BombStyleRuntime.jarTouchConnection = nil
+    end
+    BombStyleRuntime.jarLastContact = nil
     pcall(function()
         local contextActionService = game:GetService("ContextActionService")
         contextActionService:UnbindAction("__FireflyDoubleJumpMovementLock")
@@ -3562,6 +3824,9 @@ local cancelFireflyDoubleJump = function(preserveJump)
             if typeof(originalWalkSpeed) == "number" then
                 humanoid.WalkSpeed = originalWalkSpeed
             end
+            local autoRotate = humanoid:GetAttribute("__FireflyMovementLockAutoRotate")
+            if typeof(autoRotate) == "boolean" then humanoid.AutoRotate = autoRotate end
+            humanoid:SetAttribute("__FireflyMovementLockAutoRotate", nil)
             humanoid:SetAttribute("__FireflyMovementLockWalkSpeed", nil)
             humanoid:SetAttribute("__FireflyMovementLockActive", nil)
         end
@@ -3714,6 +3979,70 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
     local secondJumpRequestDeadline = nil
     local nextSecondJumpRetryAt = 0
     local nextArmTraceAt = 0
+    local firstPeakY = rootPart.Position.Y
+    local diagnosticAttempt = fireflyDiag.attempt
+    local gainMonitorStarted = false
+    local approachPreparation = nil
+    local fastReturnSamples = 0
+    local nativeRetakeoffAt = nil
+    local contactBufferActive = false
+    local motionSamples = {}
+    local deferredLids = {}
+
+    local function measureMotion()
+        local now = os.clock()
+        local camera = Workspace.CurrentCamera
+        motionSamples[#motionSamples + 1] = {time = now, velocity = rootPart.AssemblyLinearVelocity,
+            input = humanoid.MoveDirection, facing = rootPart.CFrame.LookVector,
+            camera = camera and camera.CFrame and camera.CFrame.LookVector or rootPart.CFrame.LookVector}
+        while #motionSamples > 1 and now - motionSamples[1].time > 0.25 do table.remove(motionSamples, 1) end
+    end
+
+    local function monitorGain(source, supportObserved)
+        if gainMonitorStarted then return end
+        gainMonitorStarted = true
+        local started, baseline, startY = os.clock(), firstPeakY, rootPart.Position.Y
+        local peak, risingSamples, lastTrace = startY, 0, 0
+        local requiredGain = math.max(0.5, rootPart.Size.Y * 0.5)
+        local connection
+        local monitorFinished = false
+        local function finish(outcome, reason)
+            if monitorFinished then return end
+            monitorFinished = true
+            fireflyDiag.activeGainMonitor = nil
+            if connection then
+                connection:Disconnect()
+                if fireflyDiag.untrack then fireflyDiag.untrack(connection) end
+            end
+            local gain = peak - baseline
+            fireflyDiag.log("JAR_RESULT", string.format("outcome=%s; gain=%.3f; required=%.3f; firstPeakY=%.3f; secondPeakY=%.3f; supportObserved=%s; source=%s; reason=%s",
+                outcome, gain, requiredGain, baseline, peak, tostring(supportObserved), tostring(source), tostring(reason)), diagnosticAttempt)
+            if selectedBombType == "Firefly Jar" then
+                statusLabel.Text = outcome == "height_gain" and string.format("Firefly: height gain confirmed (+%.2f)", gain)
+                    or outcome == "no_gain" and "Firefly: impulse observed, no extra height" or "Firefly: height measurement interrupted"
+            end
+        end
+        fireflyDiag.activeGainMonitor = function() finish("interrupted", "runtime cleanup") end
+        connection = fireflyDiag.track(RunService.PostSimulation:Connect(function()
+            if fireflyDiag.stopped or character ~= LocalPlayer.Character or not rootPart.Parent
+                or not humanoid.Parent or humanoid.Health <= 0 then
+                finish("interrupted", "character or runtime changed")
+                return
+            end
+            local now, y, vy = os.clock(), rootPart.Position.Y, rootPart.AssemblyLinearVelocity.Y
+            peak = math.max(peak, y)
+            if vy > 2 then risingSamples += 1 end
+            if now - lastTrace >= 0.10 then
+                lastTrace = now
+                fireflyDiag.log("BOOST_SAMPLE", string.format("dt=%.3f; rootY=%.3f; vy=%.2f; firstPeakY=%.3f; gain=%.3f",now-started,y,vy,baseline,peak-baseline), diagnosticAttempt)
+            end
+            if now - started >= 0.08 and risingSamples >= 2 and peak - startY >= 0.35 and peak - baseline >= requiredGain then
+                finish("height_gain", "sustained ascent and extra world-space height")
+            elseif now - started >= 0.85 or (now - started >= 0.18 and humanoid.FloorMaterial ~= Enum.Material.Air and vy <= 1) then
+                finish("no_gain", "extra height was not reached")
+            end
+        end))
+    end
 
     statusLabel.Text = "Firefly: tracking right arm"
     fireflyDiag.log("ARM_SENSOR", string.format("rig=%s; shoulder=%s; sensor=%s; neutral=%.4f; initialThreshold=%.4f; returnThreshold=%.4f; hipHeight=%.3f; rootHeight=%.3f",
@@ -3722,12 +4051,47 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
 
     local function lockMovement()
         fireflyDiag.log("PLAYER_LOCK_BEGIN", "temporary movement/jump action sink + world-space steering; PlayerModule remains enabled")
-        pcall(function()
+        local saved = pcall(function()
             if not humanoid:GetAttribute("__FireflyMovementLockActive") then
                 humanoid:SetAttribute("__FireflyMovementLockWalkSpeed", humanoid.WalkSpeed)
+                humanoid:SetAttribute("__FireflyMovementLockAutoRotate", humanoid.AutoRotate)
             end
             humanoid:SetAttribute("__FireflyMovementLockActive", true)
         end)
+        if not saved then return false end
+        local gameSettings, lastFacingMode
+        BombStyleRuntime.applyJarFacing = function()
+            local locked = UIS.MouseBehavior == Enum.MouseBehavior.LockCenter
+            local mode = locked and "camera-relative" or "preserve-unlocked-yaw"
+            local ok, err = pcall(function()
+                if locked then
+                    if not gameSettings then gameSettings = UserSettings():GetService("UserGameSettings") end
+                    if gameSettings.RotationType ~= Enum.RotationType.CameraRelative then
+                        gameSettings.RotationType = Enum.RotationType.CameraRelative
+                    end
+                    -- Let the engine follow the live camera, including user turns.
+                    -- World-space travel never becomes the body's facing direction.
+                    local original = humanoid:GetAttribute("__FireflyMovementLockAutoRotate")
+                    if typeof(original) == "boolean" then humanoid.AutoRotate = original end
+                else
+                    humanoid.AutoRotate = false
+                end
+            end)
+            if not ok then
+                if lastFacingMode ~= "failed" then
+                    fireflyDiag.log("FACING_POLICY_FAILED", tostring(err))
+                    lastFacingMode = "failed"
+                end
+                return false
+            end
+            if mode ~= lastFacingMode then
+                lastFacingMode = mode
+                fireflyDiag.log("FACING_POLICY", "mode=" .. mode .. "; autoRotate=" .. tostring(humanoid.AutoRotate)
+                    .. "; bodyCFrameWrites=0; cameraCFrameWrites=0")
+            end
+            return true
+        end
+        if not BombStyleRuntime.applyJarFacing() then return false end
         pcall(function()
             local contextActionService = game:GetService("ContextActionService")
             contextActionService:BindActionAtPriority(
@@ -3756,10 +4120,16 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
                     return
                 end
                 if character.Parent and humanoid.Parent and humanoid.Health > 0 then
+                    if BombStyleRuntime.applyJarFacing and not BombStyleRuntime.applyJarFacing() then
+                        cancelFireflyDoubleJump()
+                        statusLabel.Text = "Firefly: camera-facing policy unavailable"
+                        return
+                    end
                     humanoid:Move(Vector3.zero, false)
                 end
             end
         )
+        return true
     end
 
     local function clearFireflyJumpAfterSimulation()
@@ -3831,13 +4201,15 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         local result = Workspace:Raycast(rootPart.Position, Vector3.new(0, -rayLength, 0), rayParams)
         local centerHitInstance = result and result.Instance or nil
 
-        local function isLidTopHit(hit)
+        local nominalFeetY = rootPart.Position.Y - getFireflyRootHeight(character, humanoid, rootPart)
+        local function isLidTopHit(hit, footBottomY)
             if not hit or not lid or lid.Parent ~= Workspace or hit.Instance ~= lid then
                 return false
             end
             local localHitPosition = lid.CFrame:PointToObjectSpace(hit.Position)
-            return hit.Normal:Dot(lid.CFrame.UpVector) >= 0.7
-                and math.abs(localHitPosition.Y - lid.Size.Y * 0.5) <= 0.20
+            return hit.Normal.Y >= 0.7
+                and math.abs((footBottomY or nominalFeetY) - hit.Position.Y) <= 0.40
+                and math.abs(localHitPosition.Y) <= lid.Size.Y * 0.5 + 0.20
                 and math.abs(localHitPosition.X) <= lid.Size.X * 0.5
                 and math.abs(localHitPosition.Z) <= lid.Size.Z * 0.5
         end
@@ -3854,7 +4226,11 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
                     local footOrigin = Vector3.new(foot.Position.X,
                         math.max(rootPart.Position.Y, foot.Position.Y + 0.5), foot.Position.Z)
                     local hit = Workspace:Raycast(footOrigin, Vector3.new(0, -rayLength, 0), rayParams)
-                    if isLidTopHit(hit) then return lid end
+                    local frame = foot.CFrame
+                    local extent = frame and (math.abs(frame.RightVector.Y) * foot.Size.X
+                        + math.abs(frame.UpVector.Y) * foot.Size.Y + math.abs(frame.LookVector.Y) * foot.Size.Z) * 0.5
+                        or foot.Size.Y * 0.5
+                    if isLidTopHit(hit, foot.Position.Y - extent) then return lid end
                 end
             end
             -- The character can physically touch the top with its feet while the root-center
@@ -3884,7 +4260,8 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         if centerHitInstance == lid then
             return nil
         end
-        return centerHitInstance
+        if result and math.abs(nominalFeetY - result.Position.Y) <= 0.40 then return centerHitInstance end
+        return nil
     end
 
     local secondJumpRequested = false
@@ -3927,6 +4304,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         end
 
         secondJumpDetected = true
+        monitorGain(detectionSource, landedOnLid)
         sequenceStarted = false
         statusLabel.Text = detectionSource and ("Firefly: second jump detected (" .. detectionSource .. ")")
             or "Firefly: second jump detected"
@@ -4003,6 +4381,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         end)
         cancelFireflyDoubleJump()
         sequenceStarted = false
+        fireflyDiag.log("PLAYER_UNLOCK_DONE", "attempt ended; controls and movement lock restored")
     end
 
     local function requestFirstJumpAgain()
@@ -4023,14 +4402,27 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             return false
         end
 
-        if (not lid or lid.Parent ~= Workspace) and sequenceStartedAt and now < sequenceStartedAt + 1.25 then
-            firstJumpAirborne = false
-            statusLabel.Text = "Firefly: waiting for lid"
-            return false
-        end
-
-        finishAttempt("Firefly: landed off lid")
+        finishAttempt(lid and "Firefly: landed off lid" or "Firefly: landed without a detected lid")
         return true
+    end
+
+    local function prepareApproach(returnVelocity)
+        if approachPreparation or sequenceStarted then return end
+        if returnVelocity < armLength * 0.20 then fastReturnSamples = 0; return end
+        fastReturnSamples += 1
+        if fastReturnSamples < 2 or returnTravel < initialTravelThreshold or not isCharacterGrounded() then return end
+        local v, look = rootPart.AssemblyLinearVelocity, rootPart.CFrame.LookVector
+        local motion, facing = Vector3.new(v.X,0,v.Z), Vector3.new(look.X,0,look.Z)
+        if motion.Magnitude < 2 or facing.Magnitude < 0.01
+            or motion:Dot(facing) >= motion.Magnitude * facing.Magnitude * 0.50 then return end
+        local samples = table.clone(motionSamples)
+        if not lockMovement() then finishAttempt("Firefly: camera-facing policy unavailable"); return false end
+        approachPreparation = {startedAt = os.clock(), deadline = os.clock() + 0.55,
+            entrySpeed = motion.Magnitude, samples = samples}
+        humanoid.Jump = false
+        humanoid:Move(Vector3.zero, false)
+        fireflyDiag.log("APPROACH_PREPARE", string.format("entryVelocity=(%.2f,%.2f); facingDot=%.3f; returnSpeed=%.3f; maximumWait=0.55; nativeMoveOnly=true",
+            motion.X,motion.Z,motion:Dot(facing)/(motion.Magnitude*facing.Magnitude),returnVelocity))
     end
 
     local function beginTimedSequence()
@@ -4040,9 +4432,37 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         end
 
         local wasAirborneAtTrigger = isCharacterAirborne()
-        lockMovement()
+        local launchVelocity = rootPart.AssemblyLinearVelocity
+        local launchMovement = approachPreparation and Vector3.zero or Vector3.new(launchVelocity.X, 0, launchVelocity.Z)
+        if launchMovement.Magnitude < 1.25 then launchMovement = Vector3.zero end
+        local launchDirection = launchMovement / math.max(humanoid.WalkSpeed, 1)
+        if launchDirection.Magnitude > 1 then launchDirection = launchDirection.Unit end
+        measureMotion()
+        local velocity, input, look = Vector3.zero, Vector3.zero, Vector3.zero
+        local speedMean, cameraTurn = 0, 0
+        local labelSamples = approachPreparation and approachPreparation.samples or motionSamples
+        for i, sample in ipairs(labelSamples) do
+            velocity += sample.velocity; input += sample.input; look += sample.facing
+            speedMean += Vector3.new(sample.velocity.X, 0, sample.velocity.Z).Magnitude
+        end
+        for i = 2, #motionSamples do cameraTurn += math.acos(math.clamp(motionSamples[i].camera:Dot(motionSamples[i - 1].camera), -1, 1)) end
+        local count = math.max(1, #labelSamples)
+        velocity, input, look = velocity / count, input / count, look / count
+        fireflyDiag.log("MOTION_PROFILE", string.format("window=0.25; samples=%d; velocity=(%.2f,%.2f,%.2f); input=(%.2f,%.2f); facing=(%.2f,%.2f); speedMean=%.2f; cameraTurnDeg=%.1f; mouseLocked=%s; root=(%.2f,%.2f,%.2f); samplePhase=%s; releaseVelocity=(%.2f,%.2f,%.2f)",
+            count,velocity.X,velocity.Y,velocity.Z,input.X,input.Z,look.X,look.Z,speedMean/count,math.deg(cameraTurn),tostring(UIS.MouseBehavior == Enum.MouseBehavior.LockCenter),rootPart.Position.X,rootPart.Position.Y,rootPart.Position.Z,
+            approachPreparation and "before-preparation" or "before-jump", launchVelocity.X,launchVelocity.Y,launchVelocity.Z))
+        firstPeakY = rootPart.Position.Y
+        if (not approachPreparation and not lockMovement())
+            or (approachPreparation and BombStyleRuntime.applyJarFacing and not BombStyleRuntime.applyJarFacing()) then
+            finishAttempt("Firefly: camera-facing policy unavailable")
+            return false
+        end
+        if approachPreparation then
+            fireflyDiag.log("APPROACH_SETTLED", string.format("preparation=%.3fs; entrySpeed=%.2f; releaseSpeed=%.2f; nativeMoveOnly=true",
+                os.clock()-approachPreparation.startedAt,approachPreparation.entrySpeed,Vector3.new(launchVelocity.X,0,launchVelocity.Z).Magnitude))
+        end
         pcall(function()
-            humanoid:Move(Vector3.zero, false)
+            humanoid:Move(launchDirection, false)
         end)
 
         sequenceStarted = true
@@ -4061,6 +4481,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         secondJumpRequestStartedAt = nil
         secondJumpRequestInitialRelativeVelocity = nil
         secondJumpRequestDeadline = nil
+        nativeRetakeoffAt, contactBufferActive = nil, false
         nextSecondJumpRetryAt = 0
         if wasAirborneAtTrigger then
             firstJumpRequestDeadline = nil
@@ -4102,7 +4523,8 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             end,
             function(message)
                 finishAttempt(message)
-            end
+            end,
+            launchMovement
         )
         return true
     end
@@ -4174,6 +4596,12 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         end
 
         if newState == Enum.HumanoidStateType.Jumping then
+            if firstJumpAirborne and not nativeRetakeoffAt
+                and (oldState == Enum.HumanoidStateType.Climbing or oldState == Enum.HumanoidStateType.Landed
+                    or (oldState == Enum.HumanoidStateType.Running and firstLandingSeen)) then
+                nativeRetakeoffAt = os.clock()
+                fireflyDiag.log("NATIVE_RETAKEOFF_PENDING", "fresh native Jumping transition after contact; waiting for actual upward impulse")
+            end
             if isSecondJumpBeginning() then
                 local verticalVelocity = rootPart.AssemblyLinearVelocity.Y
                 if verticalVelocity >= getFireflyJumpConfirmationSpeed(humanoid) then
@@ -4205,9 +4633,48 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
         end
     end)
 
+    -- Buffer only native Jump input immediately before simulation. A top-face
+    -- ray near the actual feet can prepare a short contact without converting
+    -- a torso/side touch into an air jump. Only real supported states below
+    -- authorize ChangeState through the existing second-jump request.
+    local beforePhysicsOk, beforePhysicsConnection = pcall(function()
+        return RunService.PreSimulation:Connect(function(deltaTime)
+            if BombStyleRuntime.jarStepMovement then BombStyleRuntime.jarStepMovement(deltaTime) end
+            if not sequenceStarted or not firstJumpAirborne or secondJumpDetected
+                or not character.Parent or not rootPart.Parent or not humanoid.Parent or humanoid.Health <= 0 then return end
+            local lid, state = fireflyDoubleJumpLid, humanoid:GetState()
+            local topContact = lid and lid.Parent == Workspace and state ~= Enum.HumanoidStateType.Climbing
+                and getGroundPart(true) == lid
+            local forecast = BombStyleRuntime.jarContactForecast
+            local imminentContact = forecast and forecast.lid == lid and os.clock() - forecast.observedAt <= 0.05
+                and state ~= Enum.HumanoidStateType.Climbing
+            if topContact or imminentContact then
+                if not contactBufferActive then
+                    contactBufferActive = true
+                    fireflyDiag.log("NATIVE_CONTACT_BUFFER", (topContact and "top-face ray at feet" or "swept feet/top entry during next physics step") .. "; native Jump input only; no velocity write")
+                end
+                humanoid.Jump = true
+                if topContact and not landedOnLid and (state == Enum.HumanoidStateType.Landed
+                    or (humanoid.FloorMaterial ~= Enum.Material.Air
+                        and (state == Enum.HumanoidStateType.Running or state == Enum.HumanoidStateType.RunningNoPhysics)
+                        and rootPart.AssemblyLinearVelocity.Y <= math.max(lid.AssemblyLinearVelocity.Y, 0) + 2)) then
+                    firstLandingSeen = true
+                    registerLandedOnLid()
+                end
+            else
+                if contactBufferActive and inputWindowDeadline and os.clock() >= inputWindowDeadline
+                    and not secondJumpRequested then humanoid.Jump = false end
+                contactBufferActive = false
+            end
+        end)
+    end)
+    if beforePhysicsOk then BombStyleRuntime.jarBeforePhysics = beforePhysicsConnection
+    else fireflyDiag.log("CONTACT_BUFFER_UNAVAILABLE", tostring(beforePhysicsConnection)) end
+
     local lastSecondJumpPhysicsDiagAt = 0
     fireflyDoubleJumpPhysicsConnection = RunService.PostSimulation:Connect(function()
         confirmFirstTakeoff()
+        if firstJumpAirborne and not firstJumpDescentObserved then firstPeakY = math.max(firstPeakY, rootPart.Position.Y) end
         if not sequenceStarted
             or not firstJumpAirborne
             or secondJumpDetected
@@ -4220,8 +4687,13 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
 
         -- A brief physical landing can occur between rendered frames without a
         -- matching StateChanged callback. Require the same grounded/top-face check.
+        local supportState = humanoid:GetState()
         if not landedOnLid and fireflyDoubleJumpLid ~= nil
-            and isCharacterGrounded() and getGroundPart() == fireflyDoubleJumpLid then
+            and (supportState == Enum.HumanoidStateType.Landed
+                or (humanoid.FloorMaterial ~= Enum.Material.Air
+                    and (supportState == Enum.HumanoidStateType.Running or supportState == Enum.HumanoidStateType.RunningNoPhysics)
+                    and rootPart.AssemblyLinearVelocity.Y <= math.max(fireflyDoubleJumpLid.AssemblyLinearVelocity.Y, 0) + 2))
+            and getGroundPart(true) == fireflyDoubleJumpLid then
             fireflyDiag.log("LID_PHYSICS_CONTACT", "grounded top-face contact observed after simulation")
             firstLandingSeen = true
             registerLandedOnLid()
@@ -4246,7 +4718,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
                 .. "; state=" .. tostring(currentState))
         end
 
-        if firstJumpDescentObserved
+        if (firstJumpDescentObserved or (nativeRetakeoffAt and os.clock() - nativeRetakeoffAt <= 0.15))
             and verticalVelocity >= getFireflyJumpConfirmationSpeed(humanoid)
             and (currentState == Enum.HumanoidStateType.Jumping
                 or currentState == Enum.HumanoidStateType.Freefall) then
@@ -4254,19 +4726,15 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
                 and os.clock() - lastClimbingStateAt <= 0.25
                 and (lastLandingStateAt == nil or lastLandingStateAt < lastClimbingStateAt)
             if recentClimbingContact and not (landedOnLid and secondJumpRequested) then
-                fireflyDiag.log("NON_LID_REBOUND_ABORT", "upward impulse followed recent Climbing contact without a confirmed lid-jump request; restoring controls; vy="
-                    .. string.format("%.2f", verticalVelocity)
-                    .. "; state=" .. tostring(currentState)
-                    .. "; lidLanded=" .. tostring(landedOnLid)
-                    .. "; secondRequested=" .. tostring(secondJumpRequested))
-                finishAttempt("Firefly: side-climb rebound; controls restored")
+                fireflyDiag.log("CLIMB_ASCENT_CANDIDATE", "upward impulse after near-lid Climbing; measuring actual height before classifying")
+                releaseAfterSecondJump("ascent after near-lid climbing")
             elseif landedOnLid and secondJumpRequested then
                 fireflyDiag.log("POST_DESCENT_TAKEOFF", "confirmed upward impulse after requested lid jump; vy="
                     .. string.format("%.2f", verticalVelocity)
                     .. "; state=" .. tostring(currentState)
                     .. "; lidLanded=true; secondRequested=true; releasing controls now")
                 releaseAfterSecondJump("confirmed post-descent lid jump impulse")
-            else
+            elseif fireflyDoubleJumpLid and fireflyDoubleJumpLid.Parent == Workspace then
                 -- Preserve the fallback for cases where contact happened on the top edge but
                 -- the root-center ray still did not recognize the lid. Recent side-climb contact
                 -- is excluded above so this does not misclassify the lateral rebound as success.
@@ -4276,6 +4744,8 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
                     .. "; lidLanded=" .. tostring(landedOnLid)
                     .. "; secondRequested=" .. tostring(secondJumpRequested))
                 releaseAfterSecondJump("post-descent takeoff fallback")
+            else
+                finishAttempt("Firefly: upward impulse without a detected lid; no Jar result inferred")
             end
             return
         end
@@ -4363,11 +4833,38 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             return
         end
         local distance = (lid.Position - rootPart.Position).Magnitude
-        if distance > math.max(12, armLength * 4) then
-            fireflyDiag.log("LID_REJECTED", string.format("outside jar vicinity; distance=%.2f; path=%s",distance,lid:GetFullName()))
+        local planarSpeed = Vector3.new(lid.AssemblyLinearVelocity.X, 0, lid.AssemblyLinearVelocity.Z).Magnitude
+        local reach = math.max(12, armLength * 4, (math.max(humanoid.WalkSpeed, 0) + math.min(planarSpeed, 24)) * 0.35
+            + math.max(lid.Size.X, lid.Size.Z))
+        if distance > reach then
+            if not deferredLids[lid] and distance <= reach * 2 then
+                deferredLids[lid] = os.clock()
+                fireflyDiag.log("LID_DEFERRED", string.format("distance=%.2f; reach=%.2f; pos=(%.2f,%.2f,%.2f); path=%s",
+                    distance,reach,lid.Position.X,lid.Position.Y,lid.Position.Z,lid:GetFullName()))
+            end
             return
         end
+        deferredLids[lid] = nil
+        local previousLid = fireflyDoubleJumpLid
         bindFireflyLid(lid)
+        if previousLid ~= lid and BombStyleRuntime.jarTouchConnection then
+            BombStyleRuntime.jarTouchConnection:Disconnect()
+            BombStyleRuntime.jarTouchConnection = nil
+            BombStyleRuntime.jarLastContact = nil
+        end
+        if not BombStyleRuntime.jarTouchConnection then
+            local ok, connection = pcall(function()
+                return lid.Touched:Connect(function(part)
+                    if not part or not part:IsDescendantOf(character) or not sequenceStarted then return end
+                    BombStyleRuntime.jarLastContact = {lid = lid, time = os.clock(), part = part.Name}
+                    local surface = BombStyleRuntime.jarTopPoint(lid, rootPart.Position)
+                    fireflyDiag.log("LID_TOUCH", string.format("part=%s; state=%s; nominalFeetGap=%.3f; supportNotAssumed=true",
+                        part.Name, tostring(humanoid:GetState()), rootPart.Position.Y-getFireflyRootHeight(character,humanoid,rootPart)-surface.Y))
+                end)
+            end)
+            if ok then BombStyleRuntime.jarTouchConnection = connection
+            else fireflyDiag.log("TOUCH_OBSERVER_UNAVAILABLE", tostring(connection)) end
+        end
         local p, v = lid.Position, lid.AssemblyLinearVelocity
         fireflyDiag.log("LID_BOUND", string.format("path=%s; distance=%.2f; pos=(%.2f,%.2f,%.2f); velocity=(%.2f,%.2f,%.2f); collide=%s; anchored=%s; creator=%s; size=(%.2f,%.2f,%.2f); up=(%.2f,%.2f,%.2f)",
             lid:GetFullName(),distance,p.X,p.Y,p.Z,v.X,v.Y,v.Z,tostring(lid.CanCollide),tostring(lid.Anchored),tostring(creator and creator.Value),
@@ -4395,8 +4892,20 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             finishAttempt("Firefly: character unavailable")
             return
         end
+        if not fireflyDoubleJumpLid then
+            for lid, observedAt in pairs(deferredLids) do
+                if not lid.Parent or now - observedAt > 0.35 then deferredLids[lid] = nil
+                else handleFireflyLidAppearance(lid) end
+                if fireflyDoubleJumpLid then break end
+            end
+        end
 
         if not sequenceStarted then
+            measureMotion()
+            if approachPreparation and now >= approachPreparation.deadline then
+                finishAttempt("Firefly: release marker not reached after movement preparation")
+                return
+            end
             if now - startedAt > Config.FIREFLY_ARM_TRACK_TIMEOUT then
                 finishAttempt("Firefly: right arm trigger timed out")
                 return
@@ -4460,6 +4969,7 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
                 local returnVelocity = -velocity * firstDirection
                 if returnVelocity > 0.01 then
                     returnTravel = returnTravel + math.abs(step)
+                    if prepareApproach(returnVelocity) == false then return end
                     local returnRatio = firstLegTravel > 0 and returnTravel / firstLegTravel or 0
                     if returnTravel >= returnTravelThreshold
                         and returnRatio >= Config.FIREFLY_FIRST_JUMP_RETURN_RATIO then
@@ -4517,7 +5027,8 @@ local function armFireflyDoubleJump(character, humanoid, rootPart, shoulder, pre
             if now >= nextSecondJumpRetryAt
                 and lid and lid.Parent == Workspace
                 and humanoid.FloorMaterial ~= Enum.Material.Air
-                and math.abs(rootPart.AssemblyLinearVelocity.Y) <= 1.5
+                and (humanoid:GetState() == Enum.HumanoidStateType.Running
+                    or humanoid:GetState() == Enum.HumanoidStateType.Landed)
                 and getGroundPart(true) == lid then
                 nextSecondJumpRetryAt = now + 0.06
                 issueSecondJumpRequest()
@@ -4626,49 +5137,71 @@ local function armBombBounce(character, humanoid, rootPart, bombPart, targetPosi
     end
 
     if savedBombSettings.BombStyle == "Blatant" and selectedBombType ~= "Firefly Jar" then
+        if BombStyleRuntime.airJump and BombStyleRuntime.airJump.cancel then
+            BombStyleRuntime.airJump.cancel("superseded")
+        end
+        local intent, finished, jumpConnection = {}, false, nil
         local deadline = os.clock() + Config.BOMB_BOUNCE_TRACK_TIME
-        local finished = false
-        local jumpConnection
-
+        BombStyleRuntime.airJump = intent
+        local function log(tag, detail)
+            -- Diagnostics are observers; a broken panel/export must not stop this mode.
+            if fireflyDiag.logBomb then pcall(fireflyDiag.logBomb, tag, detail) end
+        end
         local function finish()
             finished = true
-            if jumpConnection then
-                jumpConnection:Disconnect()
-                jumpConnection = nil
-            end
+            if jumpConnection then jumpConnection:Disconnect(); jumpConnection = nil end
+            if BombStyleRuntime.airJump == intent then BombStyleRuntime.airJump = nil end
         end
-
+        intent.cancel = function(reason)
+            if finished then return end
+            finish()
+            log("AIR_CANCELLED", tostring(reason))
+        end
         local function tryAirJump()
             if finished then return true end
-            if fireflyDiag.stopped or character ~= LocalPlayer.Character
+            if BombStyleRuntime.active == false or character ~= LocalPlayer.Character
                 or not character.Parent or not rootPart.Parent or not humanoid.Parent or humanoid.Health <= 0 then
-                finish()
+                intent.cancel("character or runtime changed")
                 return true
             end
-
             local velocity = rootPart.AssemblyLinearVelocity
-            if velocity.Y > -Config.BOMB_LAUNCH_FALL_SPEED then
-                return false
-            end
+            if velocity.Y > -Config.BOMB_LAUNCH_FALL_SPEED then return false end
 
+            -- Original timing, original configuration, one impulse. No contact gate,
+            -- dispatch-time jump, alternate speed, or post-physics rewrite.
             local jumpVelocity = humanoid.UseJumpPower and humanoid.JumpPower
                 or math.sqrt(math.max(0, 2 * Workspace.Gravity * humanoid.JumpHeight))
-            finish()
+            finish() -- Always release ownership, including when an engine write errors.
             pcall(function()
                 humanoid.Jump = false
                 humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
             end)
-            rootPart.AssemblyLinearVelocity = Vector3.new(velocity.X, math.max(velocity.Y, jumpVelocity), velocity.Z)
+            local startY = rootPart.Position.Y
+            local ok, err = pcall(function()
+                rootPart.AssemblyLinearVelocity = Vector3.new(velocity.X, math.max(velocity.Y, jumpVelocity), velocity.Z)
+            end)
+            if not ok then
+                statusLabel.Text = "Blatant: air jump write failed"
+                log("AIR_FAILED", "velocity write: " .. tostring(err))
+                return true
+            end
             statusLabel.Text = "Blatant: air jump"
-            fireflyDiag.log("BLATANT_JUMP", string.format("impulse=%.2f; previousY=%.2f; independent of bomb contact",jumpVelocity,velocity.Y))
+            log("AIR_APPLIED", string.format("speed=%.2f; previousY=%.2f; rootY=%.3f; write=1; independentOfBomb=true; timing=original",
+                jumpVelocity, velocity.Y, startY))
+            task.delay(0.08, function()
+                if BombStyleRuntime.active == false or character ~= LocalPlayer.Character
+                    or not rootPart.Parent or not humanoid.Parent then return end
+                log("AIR_OBSERVATION", string.format("dy=%.3f; vy=%.2f; state=%s; readOnly=true",
+                    rootPart.Position.Y - startY, rootPart.AssemblyLinearVelocity.Y, tostring(humanoid:GetState())))
+            end)
             return true
         end
-
+        log("AIR_ARMED", "original post-throw point; single impulse; awaiting original descent threshold")
         if tryAirJump() then return end
         jumpConnection = RunService.PostSimulation:Connect(function()
             if os.clock() >= deadline then
                 finish()
-                fireflyDiag.log("BLATANT_JUMP_END", "descent threshold not reached before timeout")
+                log("AIR_FAILED", "descent threshold not reached before timeout")
                 return
             end
             tryAirJump()
@@ -5201,6 +5734,7 @@ local function activateFireflyJar()
 end
 
 local function launchPendingBombJump()
+    if BombStyleRuntime.active == false then return end
     if not pendingBombJump or pendingBombLaunchInProgress then
         return
     end
@@ -5274,6 +5808,16 @@ local function launchPendingBombJump()
     local descendantConnection
     local detectionDeadline = os.clock() + 0.18
     local launchConfirmed = false
+    local isBlatantLaunch = savedBombSettings.BombStyle == "Blatant" and selectedBombType ~= "Firefly Jar"
+    local function auxiliary(label, callback, ...)
+        if not isBlatantLaunch then return callback(...) end
+        local ok, value = pcall(callback, ...)
+        if ok then return value end
+        if fireflyDiag.logBomb then
+            pcall(fireflyDiag.logBomb, "AUXILIARY_ERROR", label .. ": " .. tostring(value))
+        end
+        return nil
+    end
     local throwOrigin = rootPart.Position
     local rightHand = character:FindFirstChild("RightHand")
         or character:FindFirstChild("Right Arm")
@@ -5291,7 +5835,7 @@ local function launchPendingBombJump()
     launchOverlapParams.FilterDescendantsInstances = {character, bombTool}
     launchOverlapParams.MaxParts = 128
 
-    for _, instance in ipairs(Workspace:GetPartBoundsInRadius(throwOrigin, 24, launchOverlapParams)) do
+    for _, instance in ipairs((auxiliary("bomb snapshot", Workspace.GetPartBoundsInRadius, Workspace, throwOrigin, 24, launchOverlapParams) or {})) do
         existingBombParts[instance] = true
     end
 
@@ -5359,7 +5903,7 @@ local function launchPendingBombJump()
             consider(instance)
         end
 
-        for _, instance in ipairs(Workspace:GetPartBoundsInRadius(throwOrigin, 24, launchOverlapParams)) do
+        for _, instance in ipairs((auxiliary("bomb snapshot", Workspace.GetPartBoundsInRadius, Workspace, throwOrigin, 24, launchOverlapParams) or {})) do
             consider(instance)
         end
 
@@ -5435,7 +5979,7 @@ local function launchPendingBombJump()
         task.delay(0.02, function()
             bombDetectionScheduled = false
             if not bombPart then
-                selectNewlySpawnedBombPart()
+                auxiliary("bomb candidate", selectNewlySpawnedBombPart)
             end
         end)
     end)
@@ -5444,6 +5988,10 @@ local function launchPendingBombJump()
         launchConfirmed = true
     end)
 
+    if savedBombSettings.BombStyle == "Blatant" and selectedBombType ~= "Firefly Jar" then
+        auxiliary("throw diagnostic", fireflyDiag.logBomb, "THROW_READY", string.format("state=%s; vy=%.2f; rootY=%.3f; generation=%s",
+            tostring(humanoid:GetState()),rootPart.AssemblyLinearVelocity.Y,rootPart.Position.Y,tostring(launchGeneration)))
+    end
     local directRemoteLaunch, remoteTargetPosition = fireBombRemote(
         bombTool,
         character,
@@ -5456,6 +6004,9 @@ local function launchPendingBombJump()
     if directRemoteLaunch then
         targetPosition = remoteTargetPosition
         bombTrace = BombStyleRuntime.latestTrace
+        if savedBombSettings.BombStyle == "Blatant" and selectedBombType ~= "Firefly Jar" then
+            auxiliary("throw diagnostic", fireflyDiag.logBomb, "THROW_DISPATCHED", "local dispatch completed; original post-throw air-jump timing retained")
+        end
     else
         targetPosition, _, targetPart = getPredictedBombTarget(
             character,
@@ -5467,7 +6018,7 @@ local function launchPendingBombJump()
     end
 
     if directRemoteLaunch then
-        selectNewlySpawnedBombPart()
+        auxiliary("bomb candidate", selectNewlySpawnedBombPart)
     end
 
     if not targetPosition then
@@ -5479,7 +6030,7 @@ local function launchPendingBombJump()
             bombTool.ManualActivationOnly = pendingBombManualActivationOriginal
         end)
         pendingBombManualActivationOriginal = nil
-        unlockBombActivation()
+        auxiliary("activation cleanup", unlockBombActivation)
         if not wasEquipped and bombTool.Parent == character then
             pcall(function()
                 humanoid:UnequipTools()
@@ -5509,7 +6060,7 @@ local function launchPendingBombJump()
                 bombTool.ManualActivationOnly = pendingBombManualActivationOriginal
             end)
             pendingBombManualActivationOriginal = nil
-            unlockBombActivation()
+            auxiliary("activation cleanup", unlockBombActivation)
             if not wasEquipped and bombTool.Parent == character then
                 pcall(function()
                     humanoid:UnequipTools()
@@ -5528,7 +6079,7 @@ local function launchPendingBombJump()
                 bombTool.ManualActivationOnly = pendingBombManualActivationOriginal
             end)
             pendingBombManualActivationOriginal = nil
-            unlockBombActivation()
+            auxiliary("activation cleanup", unlockBombActivation)
             if not wasEquipped and bombTool.Parent == character then
                 pcall(function()
                     humanoid:UnequipTools()
@@ -5591,7 +6142,7 @@ local function launchPendingBombJump()
         end)
     end
 
-    unlockBombActivation()
+    auxiliary("activation cleanup", unlockBombActivation)
 
     task.spawn(function()
         RunService.Heartbeat:Wait()
@@ -5614,13 +6165,13 @@ local function launchPendingBombJump()
     end
 
     if not bombPart then
-        bombPart = findNearbyBombPart(character, bombTool, targetPosition)
+        bombPart = auxiliary("nearby target", findNearbyBombPart, character, bombTool, targetPosition)
         if not bombPart then
-            bombPart = findNearbyBombPart(character, bombTool, throwOrigin)
+            bombPart = auxiliary("nearby origin", findNearbyBombPart, character, bombTool, throwOrigin)
         end
     end
 
-    BombStyleRuntime.traceBomb(bombTrace, bombPart, character, rootPart)
+    auxiliary("bomb trace", BombStyleRuntime.traceBomb, bombTrace, bombPart, character, rootPart)
     armBombBounce(character, humanoid, rootPart, bombPart, targetPosition, bombTool, function()
         return bombPart
     end)
@@ -5633,17 +6184,17 @@ local function launchPendingBombJump()
                 break
             end
             if not bombPart then
-                selectNewlySpawnedBombPart()
+                auxiliary("bomb candidate", selectNewlySpawnedBombPart)
             end
             if not bombPart then
-                bombPart = findNearbyBombPart(character, bombTool, targetPosition)
+                bombPart = auxiliary("nearby target", findNearbyBombPart, character, bombTool, targetPosition)
                 if not bombPart then
-                    bombPart = findNearbyBombPart(character, bombTool, throwOrigin)
+                    bombPart = auxiliary("nearby origin", findNearbyBombPart, character, bombTool, throwOrigin)
                 end
             end
 
             if bombPart and bombPart.Parent then
-                BombStyleRuntime.traceBomb(bombTrace, bombPart, character, rootPart)
+                auxiliary("bomb trace", BombStyleRuntime.traceBomb, bombTrace, bombPart, character, rootPart)
                 if not directRemoteLaunch then
                     placeBombAtTarget(bombPart, character, targetPosition)
                 end
@@ -5898,6 +6449,7 @@ local function beginPendingBombJump(isToggleMode, bombTool, character, humanoid,
 end
 
 local function quickUseBomb(isToggleMode, armOnly)
+    if BombStyleRuntime.active == false then return false end
     if selectedBombType == "Firefly Jar" then
         return activateFireflyJar()
     end
@@ -6265,10 +6817,18 @@ bombButton.Activated:Connect(function()
     end)
 end)
 local function setupCharacter(character)
+    if BombStyleRuntime.active == false then return end
     local humanoid = character:WaitForChild("Humanoid")
+    if BombStyleRuntime.active == false or character ~= LocalPlayer.Character then return end
+    for _, connection in ipairs(fireflyDiag.characterConnections or {}) do
+        pcall(function() connection:Disconnect() end)
+        fireflyDiag.untrack(connection)
+    end
+    fireflyDiag.characterConnections = {}
     local freefallAutoConnection
 
-    humanoid.Died:Connect(function()
+    fireflyDiag.characterConnections[1] = humanoid.Died:Connect(function()
+        if BombStyleRuntime.active == false or character ~= LocalPlayer.Character then return end
         if freefallAutoConnection then
             freefallAutoConnection:Disconnect()
             freefallAutoConnection = nil
@@ -6283,7 +6843,8 @@ local function setupCharacter(character)
         bombPressWasDragged = false
     end)
 
-    humanoid.StateChanged:Connect(function(_, state)
+    fireflyDiag.characterConnections[2] = humanoid.StateChanged:Connect(function(_, state)
+        if BombStyleRuntime.active == false or character ~= LocalPlayer.Character then return end
         local persistentMode = bombUseMode == "Toggle To Use Bomb"
             or (bombUseMode == "Armed To Use Bomb" and isArmedBomb)
 
@@ -6359,12 +6920,14 @@ local function setupCharacter(character)
             bombActionInProgress = false
         end)
     end)
+    fireflyDiag.characterConnections[3] = freefallAutoConnection
+    for _, connection in ipairs(fireflyDiag.characterConnections) do fireflyDiag.track(connection) end
 end
 
 if LocalPlayer.Character then
     task.defer(setupCharacter, LocalPlayer.Character)
 end
-LocalPlayer.CharacterAdded:Connect(function(character)
+fireflyDiag.runtimeConnections[#fireflyDiag.runtimeConnections + 1] = LocalPlayer.CharacterAdded:Connect(function(character)
     resetBombCooldown()
     setupCharacter(character)
 end)
@@ -6374,3 +6937,20 @@ if fireflyDiag.initError or fireflyDiag.guiError then
     statusLabel.Text = "Controller ready; Jar diagnostics error: " .. tostring(fireflyDiag.initError or fireflyDiag.guiError)
 end
 updateBombVisuals()
+
+
+do
+    local previousCleanup = sharedEnv.__StandaloneBombJumpFireflyCleanup
+    sharedEnv.__StandaloneBombJumpFireflyCleanup = function()
+        if fireflyDiag.activeGainMonitor then pcall(fireflyDiag.activeGainMonitor) end
+        BombStyleRuntime.active = false
+        fireflyDiag.stopped = true
+        if BombStyleRuntime.airJump and BombStyleRuntime.airJump.cancel then pcall(BombStyleRuntime.airJump.cancel, "runtime cleanup") end
+        pcall(cancelPendingBombJump)
+        pcall(resetBombCooldown)
+        pcall(unlockBombActivation)
+        for _, connection in ipairs(fireflyDiag.runtimeConnections) do pcall(function() connection:Disconnect() end) end
+        table.clear(fireflyDiag.runtimeConnections)
+        if type(previousCleanup) == "function" then pcall(previousCleanup) end
+    end
+end
